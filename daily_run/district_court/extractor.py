@@ -308,6 +308,18 @@ class DCContinuousExtractor:
             "consecutive_fail_cutoff": 0,
         }
 
+        def log_captcha_attempt(
+            attempt_no: int,
+            prediction: str | None,
+            response: str,
+        ) -> None:
+            logger.info(
+                "[DC] attempt:%d prediction:%s response:%s",
+                attempt_no,
+                prediction if prediction else "-",
+                response,
+            )
+
         def log_summary(state: str, total: int = 0) -> None:
             logger.info(
                 "[DC] Search summary: state=%s dist=%s complex=%s est=%s type=%s year=%d status=%s result=%s total=%d attempts=%d solved=%d rejected=%d empty=%d no_image=%d transport=%d parse=%d",
@@ -337,6 +349,7 @@ class DCContinuousExtractor:
             img_bytes = await self._download_captcha_bytes()
             if not img_bytes:
                 stats["captcha_image_missing"] += 1
+                log_captcha_attempt(attempt, None, "fail")
                 consec_fail += 1
                 if consec_fail >= MAX_CAPTCHA_CONSEC_FAILS:
                     stats["consecutive_fail_cutoff"] += 1
@@ -348,6 +361,7 @@ class DCContinuousExtractor:
 
             if not captcha:
                 stats["captcha_empty"] += 1
+                log_captcha_attempt(attempt, None, "fail")
                 consec_fail += 1
                 if consec_fail >= MAX_CAPTCHA_CONSEC_FAILS:
                     stats["consecutive_fail_cutoff"] += 1
@@ -380,6 +394,7 @@ class DCContinuousExtractor:
 
             if not text:
                 stats["transport_failures"] += 1
+                log_captcha_attempt(attempt, captcha, "fail")
                 consec_fail += 1
                 if consec_fail >= MAX_CAPTCHA_CONSEC_FAILS:
                     stats["consecutive_fail_cutoff"] += 1
@@ -391,6 +406,7 @@ class DCContinuousExtractor:
                 data = json.loads(text)
             except Exception:
                 stats["parse_failures"] += 1
+                log_captcha_attempt(attempt, captcha, "fail")
                 consec_fail += 1
                 continue
 
@@ -400,6 +416,7 @@ class DCContinuousExtractor:
                 or '<div class="alert alert-danger' in text
             ):
                 stats["captcha_rejected"] += 1
+                log_captcha_attempt(attempt, captcha, "fail")
                 consec_fail += 1
                 if consec_fail >= MAX_CAPTCHA_CONSEC_FAILS:
                     stats["consecutive_fail_cutoff"] += 1
@@ -410,6 +427,7 @@ class DCContinuousExtractor:
             # DC endpoint can return either `case_data` or `party_data`.
             party_data = data.get("case_data") or data.get("party_data", "")
             if "Total number of cases : 0" in party_data or not party_data:
+                log_captcha_attempt(attempt, captcha, "success")
                 log_summary("no_results", 0)
                 return [], 0, "no_results"
 
@@ -455,6 +473,7 @@ class DCContinuousExtractor:
                                 }
                             )
 
+            log_captcha_attempt(attempt, captcha, "success")
             log_summary("ok", len(cases))
             return cases, len(cases), "ok"
 

@@ -287,6 +287,18 @@ class HCContinuousExtractor:
             "error_val_cutoff": 0,
         }
 
+        def log_captcha_attempt(
+            attempt_no: int,
+            prediction: str | None,
+            response: str,
+        ) -> None:
+            logger.info(
+                "[HC] attempt:%d prediction:%s response:%s",
+                attempt_no,
+                prediction if prediction else "-",
+                response,
+            )
+
         def log_summary(state: str, total: int = 0) -> None:
             logger.info(
                 "[HC] Search summary: state=%s court=%s type=%s year=%d status=%s result=%s total=%d attempts=%d solved=%d rejected=%d empty=%d no_image=%d transport=%d",
@@ -313,12 +325,14 @@ class HCContinuousExtractor:
             img_bytes = await self._download_captcha_bytes()
             if not img_bytes:
                 stats["captcha_image_missing"] += 1
+                log_captcha_attempt(attempt, None, "fail")
                 continue
 
             captcha = await captcha_solve_async(img_bytes, 6, "hc")
 
             if not captcha:
                 stats["captcha_empty"] += 1
+                log_captcha_attempt(attempt, None, "fail")
                 continue
 
             stats["captcha_solved"] += 1
@@ -346,6 +360,7 @@ class HCContinuousExtractor:
             if not text:
                 consecutive_error_val = 0
                 stats["transport_failures"] += 1
+                log_captcha_attempt(attempt, captcha, "fail")
                 continue
 
             clean = text.strip().lstrip("\ufeff").strip()
@@ -353,6 +368,7 @@ class HCContinuousExtractor:
 
             if status == "captcha_error":
                 stats["captcha_rejected"] += 1
+                log_captcha_attempt(attempt, captcha, "fail")
                 is_error_val = (
                     '"Error":"ERROR_VAL"' in clean or '"Error": "ERROR_VAL"' in clean
                 )
@@ -370,11 +386,13 @@ class HCContinuousExtractor:
 
             if status == "session_expired":
                 stats["session_refresh"] += 1
+                log_captcha_attempt(attempt, captcha, "fail")
                 await self._sm.force_refresh(HC_HOME, HC_HEADERS)
                 continue
 
             if status == "no_results":
                 stats["no_records"] += 1
+                log_captcha_attempt(attempt, captcha, "success")
                 log_summary("no_results", 0)
                 return [], 0, "no_results"
 
@@ -386,9 +404,11 @@ class HCContinuousExtractor:
                 data = json.loads(clean)
             except Exception:
                 stats["transport_failures"] += 1
+                log_captcha_attempt(attempt, captcha, "fail")
                 continue
             cases = _parse_con_field(data)
             total = int(data.get("totRecords", len(cases)))
+            log_captcha_attempt(attempt, captcha, "success")
             log_summary("ok", total)
             return cases, total, "ok"
 
