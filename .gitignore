@@ -1,6 +1,7 @@
 # Secrets — never commit
 service_account.json
 .env
+a.py
 
 # Python
 __pycache__/
