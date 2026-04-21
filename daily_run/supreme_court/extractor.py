@@ -9,7 +9,6 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
-from daily_run.config import VERBOSE_CAPTCHA_LOGS
 from utils.session_utils import SessionManager
 
 logger = logging.getLogger("legal_scraper.daily_run.sc.extractor")
@@ -158,6 +157,7 @@ class SCIContinuousExtractor:
         scid: str,
         tok_name: str,
         tok_value: str,
+        search_label: str | None = None,
     ) -> dict | None:
         """
         Search SCI by case type + case number + year.
@@ -168,20 +168,37 @@ class SCIContinuousExtractor:
         """
         from utils.captcha import solve_async as captcha_solve_async
 
+        target_label = search_label or f"case_type={case_type} year={year}"
+
         def log_captcha_attempt(
             attempt_no: int,
             prediction: str | None,
-            response: str,
+            outcome: str,
+            site_result: str,
+            *,
+            will_retry: bool = False,
         ) -> None:
-            log_fn = logger.info if VERBOSE_CAPTCHA_LOGS else logger.debug
-            log_fn(
-                "[SC] Search attempt: type=%s year=%d case_no=%d attempt=%d prediction=%s response=%s",
-                case_type,
-                year,
+            if outcome == "success":
+                logger.info(
+                    "[SC] CAPTCHA success: target={%s} case_no=%d attempt=%d/%d prediction=%s site_result=%s",
+                    target_label,
+                    case_no,
+                    attempt_no,
+                    MAX_CAPTCHA_RETRIES,
+                    prediction if prediction else "-",
+                    site_result,
+                )
+                return
+
+            logger.info(
+                "[SC] CAPTCHA fail: target={%s} case_no=%d attempt=%d/%d prediction=%s site_result=%s retry=%s",
+                target_label,
                 case_no,
                 attempt_no,
+                MAX_CAPTCHA_RETRIES,
                 prediction if prediction else "-",
-                response,
+                site_result,
+                str(attempt_no) if will_retry else "stop",
             )
 
         for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
@@ -189,7 +206,13 @@ class SCIContinuousExtractor:
             img_bytes = await self._download_captcha_bytes(scid)
             if not img_bytes:
                 self._metric_inc("captcha_image_missing")
-                log_captcha_attempt(attempt, None, "fail")
+                log_captcha_attempt(
+                    attempt,
+                    None,
+                    "fail",
+                    "captcha_image_missing",
+                    will_retry=attempt < MAX_CAPTCHA_RETRIES,
+                )
                 await asyncio.sleep(0.05)
                 continue
 
@@ -198,7 +221,13 @@ class SCIContinuousExtractor:
 
             if not captcha_val:
                 self._metric_inc("captcha_empty")
-                log_captcha_attempt(attempt, None, "fail")
+                log_captcha_attempt(
+                    attempt,
+                    None,
+                    "fail",
+                    "captcha_empty",
+                    will_retry=attempt < MAX_CAPTCHA_RETRIES,
+                )
                 continue
 
             self._metric_inc("captcha_solved")
@@ -226,7 +255,13 @@ class SCIContinuousExtractor:
             if not resp:
                 self._metric_inc("transport_failures")
                 self._metric_inc("retryable_errors")
-                log_captcha_attempt(attempt, captcha_val, "fail")
+                log_captcha_attempt(
+                    attempt,
+                    captcha_val,
+                    "fail",
+                    "no_response",
+                    will_retry=False,
+                )
                 return {"_search_state": "retryable_error"}
 
             success = resp.get("success", False)
@@ -244,7 +279,13 @@ class SCIContinuousExtractor:
 
                 if is_captcha_err:
                     self._metric_inc("captcha_rejected")
-                    log_captcha_attempt(attempt, captcha_val, "fail")
+                    log_captcha_attempt(
+                        attempt,
+                        captcha_val,
+                        "fail",
+                        "invalid_captcha",
+                        will_retry=attempt < MAX_CAPTCHA_RETRIES,
+                    )
                     await asyncio.sleep(min(0.2 + random.random() * 0.3, 0.5))
                     continue
 
@@ -252,17 +293,34 @@ class SCIContinuousExtractor:
                     "timeout" in data.lower() or "try again" in data.lower()
                 ):
                     self._metric_inc("retryable_errors")
-                    log_captcha_attempt(attempt, captcha_val, "fail")
+                    log_captcha_attempt(
+                        attempt,
+                        captcha_val,
+                        "fail",
+                        "retryable_error",
+                        will_retry=False,
+                    )
                     return {"_search_state": "retryable_error"}
 
                 if isinstance(data, str) and "no records" in data.lower():
                     self._metric_inc("no_records")
-                    log_captcha_attempt(attempt, captcha_val, "success")
+                    log_captcha_attempt(
+                        attempt,
+                        captcha_val,
+                        "success",
+                        "no_results",
+                    )
                     return None
 
                 self._metric_inc("hard_failures")
                 self._metric_inc("retryable_errors")
-                log_captcha_attempt(attempt, captcha_val, "fail")
+                log_captcha_attempt(
+                    attempt,
+                    captcha_val,
+                    "fail",
+                    "unexpected_error",
+                    will_retry=False,
+                )
                 return {"_search_state": "retryable_error"}
 
             from utils.captcha import save_captcha_image
@@ -277,21 +335,43 @@ class SCIContinuousExtractor:
 
             if "No records found" in results_html or "notfound" in results_html:
                 self._metric_inc("no_records")
-                log_captcha_attempt(attempt, captcha_val, "success")
+                log_captcha_attempt(
+                    attempt,
+                    captcha_val,
+                    "success",
+                    "no_results",
+                )
                 return None
 
             row_data = self._extract_result_row(results_html)
             if row_data:
                 self._metric_inc("search_hits")
-                log_captcha_attempt(attempt, captcha_val, "success")
+                log_captcha_attempt(
+                    attempt,
+                    captcha_val,
+                    "success",
+                    "ok",
+                )
                 return row_data
 
             self._metric_inc("hard_failures")
             self._metric_inc("retryable_errors")
-            log_captcha_attempt(attempt, captcha_val, "fail")
+            log_captcha_attempt(
+                attempt,
+                captcha_val,
+                "fail",
+                "result_parse_error",
+                will_retry=False,
+            )
             return {"_search_state": "retryable_error"}
 
         self._metric_inc("captcha_exhausted")
+        logger.warning(
+            "[SC] CAPTCHA exhausted: target={%s} case_no=%d attempts=%d",
+            target_label,
+            case_no,
+            MAX_CAPTCHA_RETRIES,
+        )
         return {"_search_state": "captcha_error"}
 
     def _extract_result_row(self, html: str) -> dict | None:

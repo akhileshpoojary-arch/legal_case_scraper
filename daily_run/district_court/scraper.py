@@ -33,7 +33,11 @@ from daily_run.config import (
 from daily_run.district_court.extractor import DCContinuousExtractor, DC_STATES
 from daily_run.district_court.parser import build_dc_row, parse_detail_html
 from daily_run.sheets_manager import DailyRunSheetsManager
-from utils.logging_utils import descending_year_progress, stage_progress
+from utils.logging_utils import (
+    dc_target_label,
+    descending_year_progress,
+    stage_progress,
+)
 from utils.normalize import normalize_row
 from utils.proxy import ProxyRotator
 from utils.session_utils import SessionManager
@@ -290,14 +294,18 @@ class DCContinuousScraper:
                 case_type_progress = stage_progress(ct_idx, len(case_types))
                 year_progress = descending_year_progress(yr, DC_START_YEAR, DC_END_YEAR)
                 status_progress = stage_progress(status_idx, len(STATUSES))
-                target_label = (
-                    f"state={state['name']} dist={dist['dist_name']} "
-                    f"complex={complex_data['complex_name']} est={est['est_name']} "
-                    f"type={case_type_name} year={yr} status={target_status}"
+                target_label = dc_target_label(
+                    state["name"],
+                    dist["dist_name"],
+                    complex_data["complex_name"],
+                    est["est_name"],
+                    case_type_name,
+                    yr,
+                    target_status,
                 )
 
                 logger.info(
-                    "[DC] Block start: worker=%s target=%s progress=states:%s districts:%s complexes:%s establishments:%s case_types:%s years:%s statuses:%s sheet_flush_at=%d session_written=%d session_detail_ok=%d",
+                    "[DC] Selection ready: worker=%s target={%s} progress=states:%s districts:%s complexes:%s establishments:%s case_types:%s years:%s statuses:%s sheet_flush_at=%d session_written=%d session_detail_ok=%d",
                     WORKER_LABEL,
                     target_label,
                     state_progress,
@@ -341,7 +349,7 @@ class DCContinuousScraper:
                 )
                 if search_state == "retryable_error":
                     logger.warning(
-                        "[DC] Search unstable: worker=%s target=%s; retrying same block.",
+                        "[DC] Search unstable: worker=%s target={%s}; retrying same block.",
                         WORKER_LABEL,
                         target_label,
                     )
@@ -453,7 +461,7 @@ class DCContinuousScraper:
                     if enqueued % telemetry_every == 0:
                         detail_done = detail_success_total + detail_failure_total
                         logger.info(
-                            "[DC] Pipeline telemetry: worker=%s target=%s search_total=%d detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d detail_left=%d in_flight=%d buffer=%d/%d stage_written=%d session_written=%d",
+                            "[DC] Pipeline telemetry: worker=%s target={%s} search_total=%d detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d detail_left=%d in_flight=%d buffer=%d/%d stage_written=%d session_written=%d",
                             WORKER_LABEL,
                             target_label,
                             count,
@@ -503,7 +511,7 @@ class DCContinuousScraper:
                 self._session_detail_total += detail_success_total
                 self._session_written_total += written_total
                 logger.info(
-                    "[DC] Stage summary: worker=%s target=%s total=%.2fs search_total=%d detail_ok=%d detail_fail=%d pending_buffer=%d written=%d session_written=%d session_detail_ok=%d stages_done=%d",
+                    "[DC] Stage summary: worker=%s target={%s} total=%.2fs search_total=%d detail_ok=%d detail_fail=%d pending_buffer=%d written=%d session_written=%d session_detail_ok=%d stages_done=%d",
                     WORKER_LABEL,
                     target_label,
                     search_elapsed,

@@ -30,7 +30,11 @@ from daily_run.config import (
 from daily_run.supreme_court.extractor import SCI_CASE_TYPES, SCIContinuousExtractor
 from daily_run.supreme_court.parser import build_sc_row
 from daily_run.sheets_manager import DailyRunSheetsManager
-from utils.logging_utils import descending_year_progress, stage_progress
+from utils.logging_utils import (
+    descending_year_progress,
+    sc_target_label,
+    stage_progress,
+)
 from utils.normalize import normalize_row
 from utils.proxy import ProxyRotator
 from utils.session_utils import SessionManager
@@ -201,13 +205,12 @@ class SCContinuousScraper:
                     year, SC_START_YEAR, SC_END_YEAR
                 )
                 case_type_progress = stage_progress(ct_idx, total_case_types)
+                target_label = sc_target_label(ct_name, ct_code, year)
 
                 logger.info(
-                    "[SC] Block start: worker=%s target=type=%s (%s) year=%d next_case_no=%d progress=case_types:%s years:%s sheet_flush_at=%d session_written=%d session_detail_ok=%d",
+                    "[SC] Selection ready: worker=%s target={%s} next_case_no=%d progress=case_types:%s years:%s sheet_flush_at=%d session_written=%d session_detail_ok=%d",
                     WORKER_LABEL,
-                    ct_name,
-                    ct_code,
-                    year,
+                    target_label,
                     case_no_start,
                     case_type_progress,
                     years_progress,
@@ -321,6 +324,7 @@ class SCContinuousScraper:
                             scid=scid,
                             tok_name=tok_name,
                             tok_value=tok_value,
+                            search_label=target_label,
                         )
                         search_state = (
                             result.get("_search_state")
@@ -398,11 +402,9 @@ class SCContinuousScraper:
                                 metric_totals[key] += int(metrics.get(key, 0))
                         detail_done = detail_success_total + detail_failure_total
                         logger.info(
-                            "[SC] Pipeline telemetry: worker=%s target=type=%s (%s) year=%d case_no_start=%d searched_upto=%d hits=%d detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d detail_left=%d in_flight=%d buffer=%d/%d stage_written=%d session_written=%d attempts=%d no_records=%d retryable=%d",
+                            "[SC] Pipeline telemetry: worker=%s target={%s} case_no_start=%d searched_upto=%d hits=%d detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d detail_left=%d in_flight=%d buffer=%d/%d stage_written=%d session_written=%d attempts=%d no_records=%d retryable=%d",
                             WORKER_LABEL,
-                            ct_name,
-                            ct_code,
-                            year,
+                            target_label,
                             case_no_start,
                             max_searched_case_no,
                             consumed_results,
@@ -461,11 +463,9 @@ class SCContinuousScraper:
                 self._session_detail_total += detail_success_total
                 self._session_written_total += written_total
                 logger.info(
-                    "[SC] Captcha summary: worker=%s target=type=%s (%s) year=%d attempts=%d solved=%d rejected=%d empty=%d no_image=%d exhausted=%d retryable=%d",
+                    "[SC] Captcha summary: worker=%s target={%s} attempts=%d solved=%d rejected=%d empty=%d no_image=%d exhausted=%d retryable=%d",
                     WORKER_LABEL,
-                    ct_name,
-                    ct_code,
-                    year,
+                    target_label,
                     captcha_totals["attempts"],
                     captcha_totals["captcha_solved"],
                     captcha_totals["captcha_rejected"],
@@ -475,11 +475,9 @@ class SCContinuousScraper:
                     captcha_totals["retryable_errors"],
                 )
                 logger.info(
-                    "[SC] Stage summary: worker=%s target=type=%s (%s) year=%d case_no_start=%d searched_upto=%d duration=%.2fs search_hits=%d detail_ok=%d detail_fail=%d written=%d no_records=%d session_written=%d session_detail_ok=%d stages_done=%d",
+                    "[SC] Stage summary: worker=%s target={%s} case_no_start=%d searched_upto=%d duration=%.2fs search_hits=%d detail_ok=%d detail_fail=%d written=%d no_records=%d session_written=%d session_detail_ok=%d stages_done=%d",
                     WORKER_LABEL,
-                    ct_name,
-                    ct_code,
-                    year,
+                    target_label,
                     case_no_start,
                     max_searched_case_no,
                     search_elapsed,
@@ -494,11 +492,9 @@ class SCContinuousScraper:
                 )
 
                 logger.info(
-                    "[SC] Block complete: worker=%s target=type=%s (%s) year=%d exhausted_at_case_no=%d empty_cutoff=%d next_year=%d next_case_no=%d session_written=%d",
+                    "[SC] Block complete: worker=%s target={%s} exhausted_at_case_no=%d empty_cutoff=%d next_year=%d next_case_no=%d session_written=%d",
                     WORKER_LABEL,
-                    ct_name,
-                    ct_code,
-                    year,
+                    target_label,
                     max_searched_case_no,
                     SC_MAX_CONSECUTIVE_FAILURES,
                     year - 1,
