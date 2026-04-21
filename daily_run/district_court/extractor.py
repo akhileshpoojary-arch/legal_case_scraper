@@ -12,7 +12,7 @@ from urllib.parse import quote
 from bs4 import BeautifulSoup
 
 from config import COMMON_HEADERS
-from daily_run.config import TESTING
+from daily_run.config import TESTING, VERBOSE_CAPTCHA_LOGS
 from utils.session_utils import SessionManager
 
 logger = logging.getLogger("legal_scraper.daily_run.dc.extractor")
@@ -275,10 +275,18 @@ class DCContinuousExtractor:
         year: int,
         case_type_code: str,
         case_status: str,
+        search_label: str | None = None,
     ) -> Tuple[list[dict], int, str]:
         from utils.captcha import solve_async as captcha_solve_async
 
         cplx_base = complex_code.split("@")[0] if "@" in complex_code else complex_code
+        target_label = (
+            search_label
+            or (
+                f"state={state_code} dist={dist_code} complex={cplx_base} "
+                f"est={est_code} type={case_type_code} year={year} status={case_status}"
+            )
+        )
 
         await self._sm.post_text(
             f"{DC_BASE}/?p=casestatus/set_data",
@@ -313,8 +321,10 @@ class DCContinuousExtractor:
             prediction: str | None,
             response: str,
         ) -> None:
-            logger.info(
-                "[DC] attempt:%d prediction:%s response:%s",
+            log_fn = logger.info if VERBOSE_CAPTCHA_LOGS else logger.debug
+            log_fn(
+                "[DC] Search attempt: target=%s attempt=%d prediction=%s response=%s",
+                target_label,
                 attempt_no,
                 prediction if prediction else "-",
                 response,
@@ -322,14 +332,8 @@ class DCContinuousExtractor:
 
         def log_summary(state: str, total: int = 0) -> None:
             logger.info(
-                "[DC] Search summary: state=%s dist=%s complex=%s est=%s type=%s year=%d status=%s result=%s total=%d attempts=%d solved=%d rejected=%d empty=%d no_image=%d transport=%d parse=%d",
-                state_code,
-                dist_code,
-                cplx_base,
-                est_code,
-                case_type_code,
-                year,
-                case_status,
+                "[DC] Search summary: target=%s result=%s total=%d attempts=%d solved=%d rejected=%d empty=%d no_image=%d transport=%d parse=%d",
+                target_label,
                 state,
                 total,
                 stats["attempts"],

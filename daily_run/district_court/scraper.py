@@ -28,10 +28,12 @@ from daily_run.config import (
     DC_START_YEAR,
     DETAIL_SESSION_POOL_SIZE,
     SYSTEM_SHARD_ID,
+    WORKER_LABEL,
 )
 from daily_run.district_court.extractor import DCContinuousExtractor, DC_STATES
 from daily_run.district_court.parser import build_dc_row, parse_detail_html
 from daily_run.sheets_manager import DailyRunSheetsManager
+from utils.logging_utils import descending_year_progress, stage_progress
 from utils.normalize import normalize_row
 from utils.proxy import ProxyRotator
 from utils.session_utils import SessionManager
@@ -81,6 +83,9 @@ class DCContinuousScraper:
         self._case_type_cache: dict[
             tuple[str, str, str, str], list[dict[str, str]]
         ] = {}
+        self._session_written_total = 0
+        self._session_detail_total = 0
+        self._session_stage_total = 0
 
     async def close(self) -> None:
         seen: set[int] = set()
@@ -126,10 +131,13 @@ class DCContinuousScraper:
                 list(DC_STATES), SYSTEM_SHARD_ID, total
             )
             logger.info(
-                "[DC] Cluster total_systems=%d shard_id=%d → %d states in this worker",
+                "[DC] Worker slice: worker=%s total_systems=%d shard_id=%d states=%d search_workers=%d detail_workers=%d",
+                WORKER_LABEL,
                 total,
                 SYSTEM_SHARD_ID,
                 len(self._states_slice),
+                max(1, int(DC_SEARCH_WORKERS)),
+                max(1, int(DC_DETAIL_WORKERS)),
             )
 
         refresh_state_slice()
@@ -275,15 +283,33 @@ class DCContinuousScraper:
                     continue
 
                 target_status = STATUSES[status_idx]
+                state_progress = stage_progress(s_idx, len(states))
+                district_progress = stage_progress(d_idx, len(districts))
+                complex_progress = stage_progress(c_idx, len(complexes))
+                establishment_progress = stage_progress(e_idx, len(establishments))
+                case_type_progress = stage_progress(ct_idx, len(case_types))
+                year_progress = descending_year_progress(yr, DC_START_YEAR, DC_END_YEAR)
+                status_progress = stage_progress(status_idx, len(STATUSES))
+                target_label = (
+                    f"state={state['name']} dist={dist['dist_name']} "
+                    f"complex={complex_data['complex_name']} est={est['est_name']} "
+                    f"type={case_type_name} year={yr} status={target_status}"
+                )
 
                 logger.info(
-                    "[DC 24/7] state=%s dist=%s est=%s type=%s year=%d status=%s",
-                    state["name"],
-                    dist["dist_name"],
-                    est["est_name"],
-                    case_type_name,
-                    yr,
-                    target_status,
+                    "[DC] Block start: worker=%s target=%s progress=states:%s districts:%s complexes:%s establishments:%s case_types:%s years:%s statuses:%s sheet_flush_at=%d session_written=%d session_detail_ok=%d",
+                    WORKER_LABEL,
+                    target_label,
+                    state_progress,
+                    district_progress,
+                    complex_progress,
+                    establishment_progress,
+                    case_type_progress,
+                    year_progress,
+                    status_progress,
+                    max(1, int(SHEET_FLUSH_CASES)),
+                    self._session_written_total,
+                    self._session_detail_total,
                 )
 
                 search_started = time.monotonic()
@@ -311,17 +337,13 @@ class DCContinuousScraper:
                     yr,
                     case_type_code,
                     target_status,
+                    search_label=target_label,
                 )
                 if search_state == "retryable_error":
                     logger.warning(
-                        "[DC] Search unstable for state=%s dist=%s complex=%s est=%s type=%s year=%d status=%s; retrying same block.",
-                        state_code,
-                        dist_code,
-                        cplx_code,
-                        est_code,
-                        case_type_code,
-                        yr,
-                        target_status,
+                        "[DC] Search unstable: worker=%s target=%s; retrying same block.",
+                        WORKER_LABEL,
+                        target_label,
                     )
                     await asyncio.sleep(3)
                     continue
@@ -378,7 +400,6 @@ class DCContinuousScraper:
                 detail_success_total = 0
                 detail_failure_total = 0
                 written_total = 0
-                telemetry_tick = 0
 
                 # Tracker for task start times
                 task_start_times: dict[asyncio.Task, float] = {}
@@ -430,14 +451,22 @@ class DCContinuousScraper:
 
                     # Telemetry
                     if enqueued % telemetry_every == 0:
+                        detail_done = detail_success_total + detail_failure_total
                         logger.info(
-                            "[DC] Pipeline telemetry: enqueued=%d detail_ok=%d detail_fail=%d in_flight=%d buffer=%d written=%d",
+                            "[DC] Pipeline telemetry: worker=%s target=%s search_total=%d detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d detail_left=%d in_flight=%d buffer=%d/%d stage_written=%d session_written=%d",
+                            WORKER_LABEL,
+                            target_label,
+                            count,
                             enqueued,
+                            detail_done,
                             detail_success_total,
                             detail_failure_total,
+                            max(count - detail_done, 0),
                             len(pending_detail_tasks),
                             len(pending),
+                            write_batch_size,
                             written_total,
+                            self._session_written_total + written_total,
                         )
 
                     # If at concurrency limit, block until at least one task finishes
@@ -470,14 +499,22 @@ class DCContinuousScraper:
                     pending.clear()
 
                 search_elapsed = time.monotonic() - search_started
+                self._session_stage_total += 1
+                self._session_detail_total += detail_success_total
+                self._session_written_total += written_total
                 logger.info(
-                    "[DC] Stage summary: total=%.2fs search_total=%d detail_ok=%d detail_fail=%d pending_buffer=%d written=%d",
+                    "[DC] Stage summary: worker=%s target=%s total=%.2fs search_total=%d detail_ok=%d detail_fail=%d pending_buffer=%d written=%d session_written=%d session_detail_ok=%d stages_done=%d",
+                    WORKER_LABEL,
+                    target_label,
                     search_elapsed,
                     count,
                     detail_success_total,
                     detail_failure_total,
                     len(pending),
                     written_total,
+                    self._session_written_total,
+                    self._session_detail_total,
+                    self._session_stage_total,
                 )
 
                 prog["status_idx"] += 1

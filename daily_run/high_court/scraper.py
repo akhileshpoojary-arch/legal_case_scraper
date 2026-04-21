@@ -28,10 +28,12 @@ from daily_run.config import (
     HC_TELEMETRY_EVERY,
     HC_START_YEAR,
     SYSTEM_SHARD_ID,
+    WORKER_LABEL,
 )
 from daily_run.high_court.extractor import HCContinuousExtractor, HIGH_COURTS
 from daily_run.high_court.parser import build_hc_row, parse_detail_html
 from daily_run.sheets_manager import DailyRunSheetsManager
+from utils.logging_utils import descending_year_progress, stage_progress
 from utils.normalize import normalize_row
 from utils.proxy import ProxyRotator
 from utils.session_utils import SessionManager
@@ -75,6 +77,9 @@ class HCContinuousScraper:
         self._bench_cache: dict[str, list[dict[str, str]]] = {}
         self._case_type_cache: dict[tuple[str, str], list[dict[str, str]]] = {}
         self._courts_slice: list[dict[str, str]] = []
+        self._session_written_total = 0
+        self._session_detail_total = 0
+        self._session_stage_total = 0
 
     async def close(self) -> None:
         seen: set[int] = set()
@@ -117,10 +122,13 @@ class HCContinuousScraper:
                 list(HIGH_COURTS), SYSTEM_SHARD_ID, total
             )
             logger.info(
-                "[HC] Cluster total_systems=%d shard_id=%d → %d high courts on this worker",
+                "[HC] Worker slice: worker=%s total_systems=%d shard_id=%d courts=%d search_workers=%d detail_workers=%d",
+                WORKER_LABEL,
                 total,
                 SYSTEM_SHARD_ID,
                 len(self._courts_slice),
+                max(1, int(HC_SEARCH_WORKERS)),
+                max(1, int(HC_DETAIL_WORKERS)),
             )
 
         refresh_court_slice()
@@ -210,14 +218,28 @@ class HCContinuousScraper:
                     continue
 
                 target_status = STATUSES[status_idx]
+                state_progress = stage_progress(s_idx, len(states))
+                bench_progress = stage_progress(b_idx, len(benches))
+                case_type_progress = stage_progress(ct_idx, len(case_types))
+                year_progress = descending_year_progress(yr, HC_START_YEAR, HC_END_YEAR)
+                status_progress = stage_progress(status_idx, len(STATUSES))
+                target_label = (
+                    f"court={state['name']} bench={bench['bench_name']} "
+                    f"type={ct['type_name']} year={yr} status={target_status}"
+                )
 
                 logger.info(
-                    "[HC 24/7] state=%s bench=%s type=%s year=%d status=%s",
-                    state["name"],
-                    bench["bench_name"],
-                    ct["type_name"],
-                    yr,
-                    target_status,
+                    "[HC] Block start: worker=%s target=%s progress=courts:%s benches:%s case_types:%s years:%s statuses:%s sheet_flush_at=%d session_written=%d session_detail_ok=%d",
+                    WORKER_LABEL,
+                    target_label,
+                    state_progress,
+                    bench_progress,
+                    case_type_progress,
+                    year_progress,
+                    status_progress,
+                    max(1, int(SHEET_FLUSH_CASES)),
+                    self._session_written_total,
+                    self._session_detail_total,
                 )
 
                 search_started = time.monotonic()
@@ -237,16 +259,18 @@ class HCContinuousScraper:
                 }
 
                 cases, count, search_state = await self._extractor.search_cases_by_type(
-                    state_code, court_code, yr, case_type_code, target_status
+                    state_code,
+                    court_code,
+                    yr,
+                    case_type_code,
+                    target_status,
+                    search_label=target_label,
                 )
                 if search_state == "retryable_error":
                     logger.warning(
-                        "[HC] Search unstable for state=%s court=%s type=%s year=%d status=%s; retrying same block.",
-                        state_code,
-                        court_code,
-                        case_type_code,
-                        yr,
-                        target_status,
+                        "[HC] Search unstable: worker=%s target=%s; retrying same block.",
+                        WORKER_LABEL,
+                        target_label,
                     )
                     await asyncio.sleep(3)
                     continue
@@ -318,7 +342,6 @@ class HCContinuousScraper:
                 detail_success_total = 0
                 detail_failure_total = 0
                 written_total = 0
-                telemetry_tick = 0
 
                 # Tracker for task start times
                 task_start_times: dict[asyncio.Task, float] = {}
@@ -360,14 +383,22 @@ class HCContinuousScraper:
 
                     # Telemetry (check every N enqueues during the fill phase)
                     if enqueued % telemetry_every == 0:
+                        detail_done = detail_success_total + detail_failure_total
                         logger.info(
-                            "[HC] Pipeline telemetry: enqueued=%d detail_ok=%d detail_fail=%d in_flight=%d write_buffer=%d written=%d",
+                            "[HC] Pipeline telemetry: worker=%s target=%s search_total=%d detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d detail_left=%d in_flight=%d write_buffer=%d/%d stage_written=%d session_written=%d",
+                            WORKER_LABEL,
+                            target_label,
+                            count,
                             enqueued,
+                            detail_done,
                             detail_success_total,
                             detail_failure_total,
+                            max(count - detail_done, 0),
                             len(pending_detail_tasks),
                             len(write_buffer),
+                            write_batch_size,
                             written_total,
+                            self._session_written_total + written_total,
                         )
 
                     # If at concurrency limit, block until at least one task finishes
@@ -390,13 +421,21 @@ class HCContinuousScraper:
 
                 written_total += await flush_write_buffer(force=True)
                 search_elapsed = time.monotonic() - search_started
+                self._session_stage_total += 1
+                self._session_detail_total += detail_success_total
+                self._session_written_total += written_total
                 logger.info(
-                    "[HC] Stage summary: total=%.2fs search_total=%d detail_ok=%d detail_fail=%d written=%d",
+                    "[HC] Stage summary: worker=%s target=%s total=%.2fs search_total=%d detail_ok=%d detail_fail=%d written=%d session_written=%d session_detail_ok=%d stages_done=%d",
+                    WORKER_LABEL,
+                    target_label,
                     search_elapsed,
                     count,
                     detail_success_total,
                     detail_failure_total,
                     written_total,
+                    self._session_written_total,
+                    self._session_detail_total,
+                    self._session_stage_total,
                 )
 
                 prog["status_idx"] += 1

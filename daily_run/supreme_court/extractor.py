@@ -9,6 +9,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
+from daily_run.config import VERBOSE_CAPTCHA_LOGS
 from utils.session_utils import SessionManager
 
 logger = logging.getLogger("legal_scraper.daily_run.sc.extractor")
@@ -115,6 +116,9 @@ class SCIContinuousExtractor:
             self._search_metrics[k] = 0
         return snapshot
 
+    def snapshot_search_metrics(self) -> dict[str, int]:
+        return dict(self._search_metrics)
+
     @property
     def case_types(self) -> list[dict[str, str]]:
         return SCI_CASE_TYPES
@@ -169,8 +173,12 @@ class SCIContinuousExtractor:
             prediction: str | None,
             response: str,
         ) -> None:
-            logger.info(
-                "[SC] attempt:%d prediction:%s response:%s",
+            log_fn = logger.info if VERBOSE_CAPTCHA_LOGS else logger.debug
+            log_fn(
+                "[SC] Search attempt: type=%s year=%d case_no=%d attempt=%d prediction=%s response=%s",
+                case_type,
+                year,
+                case_no,
                 attempt_no,
                 prediction if prediction else "-",
                 response,

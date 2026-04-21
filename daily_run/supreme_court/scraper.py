@@ -25,10 +25,12 @@ from daily_run.config import (
     SHEET_FLUSH_CASES,
     SC_START_YEAR,
     SYSTEM_SHARD_ID,
+    WORKER_LABEL,
 )
 from daily_run.supreme_court.extractor import SCI_CASE_TYPES, SCIContinuousExtractor
 from daily_run.supreme_court.parser import build_sc_row
 from daily_run.sheets_manager import DailyRunSheetsManager
+from utils.logging_utils import descending_year_progress, stage_progress
 from utils.normalize import normalize_row
 from utils.proxy import ProxyRotator
 from utils.session_utils import SessionManager
@@ -104,6 +106,9 @@ class SCContinuousScraper:
             )
         self._sheets = DailyRunSheetsManager()
         self._case_types_slice: list[dict[str, str]] = []
+        self._session_written_total = 0
+        self._session_detail_total = 0
+        self._session_stage_total = 0
 
     async def close(self) -> None:
         seen: set[int] = set()
@@ -151,10 +156,13 @@ class SCContinuousScraper:
                 list(SCI_CASE_TYPES), SYSTEM_SHARD_ID, total
             )
             logger.info(
-                "[SC] Cluster total_systems=%d shard_id=%d → %d case types on this worker",
+                "[SC] Worker slice: worker=%s total_systems=%d shard_id=%d case_types=%d search_workers=%d detail_sessions=%d",
+                WORKER_LABEL,
                 total,
                 SYSTEM_SHARD_ID,
                 len(self._case_types_slice),
+                len(self._search_extractors),
+                len(self._detail_sessions),
             )
 
         refresh_case_type_slice()
@@ -188,13 +196,24 @@ class SCContinuousScraper:
                     continue
 
                 case_no_start = prog.get("case_no", 1)
+                total_case_types = len(case_types)
+                years_progress = descending_year_progress(
+                    year, SC_START_YEAR, SC_END_YEAR
+                )
+                case_type_progress = stage_progress(ct_idx, total_case_types)
 
                 logger.info(
-                    "[SC 24/7] CaseType=%s (%s) Year=%d CaseNo=%d",
-                    ct_code,
+                    "[SC] Block start: worker=%s target=type=%s (%s) year=%d next_case_no=%d progress=case_types:%s years:%s sheet_flush_at=%d session_written=%d session_detail_ok=%d",
+                    WORKER_LABEL,
                     ct_name,
+                    ct_code,
                     year,
                     case_no_start,
+                    case_type_progress,
+                    years_progress,
+                    max(1, int(SHEET_FLUSH_CASES)),
+                    self._session_written_total,
+                    self._session_detail_total,
                 )
 
                 batch_results: list[dict[str, Any]] = []
@@ -210,6 +229,7 @@ class SCContinuousScraper:
                 detail_success_total = 0
                 detail_failure_total = 0
                 written_total = 0
+                telemetry_every = max(100, worker_count * 25)
 
                 async def build_case_row(
                     case_result: dict[str, Any],
@@ -365,6 +385,41 @@ class SCContinuousScraper:
                     if search_tick % 100 == 0:
                         prog["case_no"] = max_searched_case_no + 1
                         self._save_progress(prog)
+                    if search_tick % telemetry_every == 0:
+                        metric_totals = {
+                            "attempts": 0,
+                            "search_hits": 0,
+                            "no_records": 0,
+                            "retryable_errors": 0,
+                        }
+                        for ex in search_workers:
+                            metrics = ex.snapshot_search_metrics()
+                            for key in metric_totals:
+                                metric_totals[key] += int(metrics.get(key, 0))
+                        detail_done = detail_success_total + detail_failure_total
+                        logger.info(
+                            "[SC] Pipeline telemetry: worker=%s target=type=%s (%s) year=%d case_no_start=%d searched_upto=%d hits=%d detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d detail_left=%d in_flight=%d buffer=%d/%d stage_written=%d session_written=%d attempts=%d no_records=%d retryable=%d",
+                            WORKER_LABEL,
+                            ct_name,
+                            ct_code,
+                            year,
+                            case_no_start,
+                            max_searched_case_no,
+                            consumed_results,
+                            consumed_results,
+                            detail_done,
+                            detail_success_total,
+                            detail_failure_total,
+                            max(consumed_results - detail_done, 0),
+                            len(pending_detail_tasks),
+                            len(batch_results),
+                            max(1, int(SHEET_FLUSH_CASES)),
+                            written_total,
+                            self._session_written_total + written_total,
+                            metric_totals["attempts"],
+                            metric_totals["no_records"],
+                            metric_totals["retryable_errors"],
+                        )
 
                 for task in worker_tasks:
                     await task
@@ -402,8 +457,15 @@ class SCContinuousScraper:
                     for key, value in metrics.items():
                         captcha_totals[key] = captcha_totals.get(key, 0) + int(value)
 
+                self._session_stage_total += 1
+                self._session_detail_total += detail_success_total
+                self._session_written_total += written_total
                 logger.info(
-                    "[SC] Captcha summary: attempts=%d solved=%d rejected=%d empty=%d no_image=%d exhausted=%d retryable=%d",
+                    "[SC] Captcha summary: worker=%s target=type=%s (%s) year=%d attempts=%d solved=%d rejected=%d empty=%d no_image=%d exhausted=%d retryable=%d",
+                    WORKER_LABEL,
+                    ct_name,
+                    ct_code,
+                    year,
                     captcha_totals["attempts"],
                     captcha_totals["captcha_solved"],
                     captcha_totals["captcha_rejected"],
@@ -413,21 +475,35 @@ class SCContinuousScraper:
                     captcha_totals["retryable_errors"],
                 )
                 logger.info(
-                    "[SC] Stage summary: duration=%.2fs search_hits=%d detail_ok=%d detail_fail=%d written=%d no_records=%d",
+                    "[SC] Stage summary: worker=%s target=type=%s (%s) year=%d case_no_start=%d searched_upto=%d duration=%.2fs search_hits=%d detail_ok=%d detail_fail=%d written=%d no_records=%d session_written=%d session_detail_ok=%d stages_done=%d",
+                    WORKER_LABEL,
+                    ct_name,
+                    ct_code,
+                    year,
+                    case_no_start,
+                    max_searched_case_no,
                     search_elapsed,
                     consumed_results,
                     detail_success_total,
                     detail_failure_total,
                     written_total,
                     captcha_totals["no_records"],
+                    self._session_written_total,
+                    self._session_detail_total,
+                    self._session_stage_total,
                 )
 
                 logger.info(
-                    "[SC 24/7] Year %d CaseType %s exhausted at case_no %d (%d consecutive empty).",
-                    year,
+                    "[SC] Block complete: worker=%s target=type=%s (%s) year=%d exhausted_at_case_no=%d empty_cutoff=%d next_year=%d next_case_no=%d session_written=%d",
+                    WORKER_LABEL,
                     ct_name,
+                    ct_code,
+                    year,
                     max_searched_case_no,
                     SC_MAX_CONSECUTIVE_FAILURES,
+                    year - 1,
+                    1,
+                    self._session_written_total,
                 )
 
                 prog["year"] = year - 1

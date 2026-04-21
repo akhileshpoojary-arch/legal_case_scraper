@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import socket
 from datetime import datetime
 from pathlib import Path
 
@@ -13,6 +14,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 TESTING = _env_bool("TESTING", False)
+VERBOSE_CAPTCHA_LOGS = _env_bool("VERBOSE_CAPTCHA_LOGS", False)
 
 INDEX_SHEET_ID = "1D3SPxVV7x4gAVhH8u5RJDmu6y_IEO4etkjTQkQXExG8"
 TEMPLATE_SHEET_ID = "1TP9lPQ3doKS5M_ljmU9UrFmro05yJw_vKiXYeDwP7zU"
@@ -31,6 +33,15 @@ CONFIG_SHEET_HEADERS_ROW: tuple[str, ...] = (
 )
 WRITE_LOCK_POLL_SECONDS = 10.0
 CLUSTER_WORKER_ID = f"s{SYSTEM_SHARD_ID}"
+WORKER_HOSTNAME = (
+    os.environ.get("RAILWAY_REPLICA_ID")
+    or os.environ.get("RAILWAY_PRIVATE_DOMAIN")
+    or os.environ.get("HOSTNAME")
+    or socket.gethostname()
+    or "local"
+).strip()
+WORKER_PROCESS_ID = os.getpid()
+WORKER_LABEL = f"{CLUSTER_WORKER_ID}@{WORKER_HOSTNAME}:pid{WORKER_PROCESS_ID}"
 
 # ═══════════════════════════════════════════════════════════════
 #  CONCURRENCY — env-driven, auto-scales to available CPU cores

@@ -41,6 +41,13 @@ _NON_RETRYABLE_REASONS = {
     "forbidden",
 }
 _DEFAULT_DOMAIN = "tracxn.com"
+_DEDUP_KEY_FIELDS = (
+    "uniqueness",
+    "courtType",
+    "benchName",
+    "caseNumber",
+    "registrationDate",
+)
 
 class DailyRunSheetsManager:
 
@@ -337,6 +344,89 @@ class DailyRunSheetsManager:
             logger.warning("Could not read case numbers for dedup: %s", e)
             return set()
 
+    def _read_dedup_field_blocks(
+        self,
+        sheet_id: str,
+    ) -> tuple[Any, list[str], list[Any], int]:
+        """Fetch the columns needed for row-level dedup / cleanup decisions."""
+        sh = self._gc.open_by_key(sheet_id)
+        ws = sh.get_worksheet(0)
+        header = self._header_cache.get(sheet_id)
+        if header is None:
+            header = ws.row_values(1)
+            self._header_cache[sheet_id] = header
+        if not header:
+            return ws, [], [], 0
+
+        col_indices: list[int] = []
+        names_in_order: list[str] = []
+        for name in _DEDUP_KEY_FIELDS:
+            pos: int | None = None
+            for i, h in enumerate(header):
+                if h.strip() == name:
+                    pos = i + 1
+                    break
+            if pos is not None:
+                col_indices.append(pos)
+                names_in_order.append(name)
+
+        if not col_indices:
+            return ws, [], [], 0
+
+        letters = [self._col_index_to_letters(c) for c in col_indices]
+        vrs = ws.batch_get([f"{L}:{L}" for L in letters])
+        max_len = DailyRunSheetsManager._physical_used_row_count(ws)
+        return ws, names_in_order, vrs, max_len
+
+    def _primary_row_groups_from_sheet(self, sheet_id: str) -> list[dict[str, Any]]:
+        """
+        Return logical row groups keyed by the primary dedup columns.
+
+        Continuation rows created by overflow splitting have blank key fields, so
+        they are attached to the previous primary row group.
+        """
+        groups: list[dict[str, Any]] = []
+        try:
+            _ws, names_in_order, vrs, max_len = self._read_dedup_field_blocks(sheet_id)
+            if not names_in_order or max_len <= 1:
+                return groups
+
+            current_group: dict[str, Any] | None = None
+            for row_i in range(1, max_len):
+                row_num = row_i + 1
+                row_dict: dict[str, Any] = {}
+                has_anchor = False
+                for j, name in enumerate(names_in_order):
+                    block = vrs[j] if j < len(vrs) else []
+                    cell = ""
+                    if row_i < len(block) and block[row_i]:
+                        cell = str(block[row_i][0]).strip()
+                    row_dict[name] = cell
+                    if cell:
+                        has_anchor = True
+
+                if has_anchor:
+                    if current_group is not None:
+                        groups.append(current_group)
+                    current_group = {
+                        "sheet_id": sheet_id,
+                        "start_row": row_num,
+                        "end_row": row_num,
+                        "row_dict": row_dict,
+                        "dedup_key": row_dedup_key(row_dict),
+                    }
+                    continue
+
+                if current_group is not None:
+                    current_group["end_row"] = row_num
+
+            if current_group is not None:
+                groups.append(current_group)
+            return groups
+        except Exception as e:
+            logger.warning("Primary-row scan failed for sheet %s: %s", sheet_id, e)
+            return groups
+
     def _dedup_keys_from_sheet_rows(self, sheet_id: str) -> set[str]:
         """
         Build row_dedup_key for every data row (cross-tab dedup).
@@ -346,53 +436,9 @@ class DailyRunSheetsManager:
         payload than full grid when many columns exist).
         """
         keys: set[str] = set()
-        _want = (
-            "uniqueness",
-            "courtType",
-            "benchName",
-            "caseNumber",
-            "registrationDate",
-        )
         try:
-            sh = self._gc.open_by_key(sheet_id)
-            ws = sh.get_worksheet(0)
-            header = self._header_cache.get(sheet_id)
-            if header is None:
-                header = ws.row_values(1)
-                self._header_cache[sheet_id] = header
-            if not header:
-                return keys
-
-            col_indices: list[int] = []
-            names_in_order: list[str] = []
-            for name in _want:
-                pos: int | None = None
-                for i, h in enumerate(header):
-                    if h.strip() == name:
-                        pos = i + 1
-                        break
-                if pos is not None:
-                    col_indices.append(pos)
-                    names_in_order.append(name)
-
-            if not col_indices:
-                return keys
-
-            letters = [self._col_index_to_letters(c) for c in col_indices]
-            vrs = ws.batch_get([f"{L}:{L}" for L in letters])
-            max_len = max((len(block) for block in vrs if block), default=0)
-            if max_len <= 1:
-                return keys
-
-            for row_i in range(1, max_len):
-                row_dict: dict[str, Any] = {}
-                for j, name in enumerate(names_in_order):
-                    block = vrs[j] if j < len(vrs) else []
-                    cell = ""
-                    if row_i < len(block) and block[row_i]:
-                        cell = str(block[row_i][0]).strip()
-                    row_dict[name] = cell
-                k = row_dedup_key(row_dict)
+            for group in self._primary_row_groups_from_sheet(sheet_id):
+                k = str(group.get("dedup_key", "")).strip()
                 if k:
                     keys.add(k)
             return keys
@@ -446,17 +492,109 @@ class DailyRunSheetsManager:
         if court_type not in self._court_wide_dedup:
             # Stagger startup reads to avoid simultaneous 429s from parallel scrapers
             time.sleep(random.uniform(0.1, 8.0))
-            
+
             cached = self._load_local_dedup_cache(court_type)
+            live = self._load_court_wide_dedup(court_type)
             if cached:
-                logger.info("[%s] Initialized %d keys from local dedup cache.", court_type.upper(), len(cached))
-                self._court_wide_dedup[court_type] = cached
-            else:
-                self._court_wide_dedup[court_type] = self._load_court_wide_dedup(
-                    court_type
+                logger.info(
+                    "[%s] Initialized %d keys from local dedup cache.",
+                    court_type.upper(),
+                    len(cached),
                 )
-                self._save_local_dedup_cache(court_type, self._court_wide_dedup[court_type])
+            merged = set(cached) | set(live)
+            self._court_wide_dedup[court_type] = merged
+            self._save_local_dedup_cache(court_type, merged)
         return self._court_wide_dedup[court_type]
+
+    def find_duplicate_groups(self, court_type: str) -> dict[str, Any]:
+        """Audit duplicate logical rows across all paginated sheets for a court."""
+        ids = self._get_sheet_ids_for_court(court_type)
+        seen: dict[str, dict[str, Any]] = {}
+        duplicates: list[dict[str, Any]] = []
+        logical_rows = 0
+
+        for sid in ids:
+            for group in self._primary_row_groups_from_sheet(sid):
+                logical_rows += 1
+                key = str(group.get("dedup_key", "")).strip()
+                if not key:
+                    continue
+                if key in seen:
+                    duplicates.append(
+                        {
+                            **group,
+                            "first_sheet_id": seen[key]["sheet_id"],
+                            "first_start_row": seen[key]["start_row"],
+                            "first_end_row": seen[key]["end_row"],
+                        }
+                    )
+                    continue
+                seen[key] = group
+
+        return {
+            "court_type": court_type,
+            "sheet_ids": ids,
+            "spreadsheets": len(ids),
+            "logical_rows": logical_rows,
+            "unique_keys": len(seen),
+            "duplicates": duplicates,
+            "duplicate_groups": len(duplicates),
+        }
+
+    def cleanup_duplicate_groups(
+        self,
+        court_type: str,
+        apply_delete: bool = False,
+    ) -> dict[str, Any]:
+        """Audit and optionally delete later duplicate row groups for a court."""
+        audit = self.find_duplicate_groups(court_type)
+        duplicates = list(audit.get("duplicates", []))
+        per_sheet: dict[str, list[dict[str, Any]]] = {}
+        for dup in duplicates:
+            sid = str(dup.get("sheet_id", "")).strip()
+            if not sid:
+                continue
+            per_sheet.setdefault(sid, []).append(dup)
+
+        delete_ranges_by_sheet: dict[str, list[tuple[int, int]]] = {}
+        for sid, groups in per_sheet.items():
+            ranges: list[tuple[int, int]] = []
+            for group in sorted(groups, key=lambda item: int(item["start_row"])):
+                start_row = int(group["start_row"])
+                end_row = int(group["end_row"])
+                if ranges and start_row <= ranges[-1][1] + 1:
+                    prev_start, prev_end = ranges[-1]
+                    ranges[-1] = (prev_start, max(prev_end, end_row))
+                    continue
+                ranges.append((start_row, end_row))
+            delete_ranges_by_sheet[sid] = ranges
+
+        deleted_groups = 0
+        deleted_rows = 0
+        if apply_delete and delete_ranges_by_sheet:
+            for sid, ranges in delete_ranges_by_sheet.items():
+                sh = self._gc.open_by_key(sid)
+                ws = sh.get_worksheet(0)
+                for start_row, end_row in sorted(ranges, reverse=True):
+                    ws.delete_rows(start_row, end_row)
+                    deleted_rows += end_row - start_row + 1
+                deleted_groups += len(per_sheet.get(sid, []))
+                self._existing_case_cache.pop(sid, None)
+                self._header_cache.pop(sid, None)
+                self._case_col_cache.pop(sid, None)
+
+            self._court_wide_dedup.pop(court_type, None)
+            self._active_sheet_info.pop(court_type, None)
+            self._save_local_dedup_cache(court_type, self._load_court_wide_dedup(court_type))
+
+        return {
+            **audit,
+            "delete_ranges_by_sheet": delete_ranges_by_sheet,
+            "delete_range_count": sum(len(v) for v in delete_ranges_by_sheet.values()),
+            "deleted_groups": deleted_groups if apply_delete else 0,
+            "deleted_rows": deleted_rows if apply_delete else 0,
+            "applied": apply_delete,
+        }
 
     def _build_rows_with_overflow(
         self,

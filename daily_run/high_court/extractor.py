@@ -10,7 +10,7 @@ import urllib.parse
 from typing import Any
 
 from config import COMMON_HEADERS
-from daily_run.config import HC_MAX_DETAIL_RETRIES, TESTING
+from daily_run.config import HC_MAX_DETAIL_RETRIES, TESTING, VERBOSE_CAPTCHA_LOGS
 from utils.session_utils import SessionManager
 
 logger = logging.getLogger("legal_scraper.daily_run.hc.extractor")
@@ -270,9 +270,17 @@ class HCContinuousExtractor:
         year: int,
         case_type_code: str,
         case_status: str,
+        search_label: str | None = None,
     ) -> tuple[list[dict], int, str]:
         from utils.captcha import solve_async as captcha_solve_async
 
+        target_label = (
+            search_label
+            or (
+                f"state={state_code} court={court_code} "
+                f"type={case_type_code} year={year} status={case_status}"
+            )
+        )
         consecutive_error_val = 0
         stats = {
             "attempts": 0,
@@ -292,8 +300,10 @@ class HCContinuousExtractor:
             prediction: str | None,
             response: str,
         ) -> None:
-            logger.info(
-                "[HC] attempt:%d prediction:%s response:%s",
+            log_fn = logger.info if VERBOSE_CAPTCHA_LOGS else logger.debug
+            log_fn(
+                "[HC] Search attempt: target=%s attempt=%d prediction=%s response=%s",
+                target_label,
                 attempt_no,
                 prediction if prediction else "-",
                 response,
@@ -301,12 +311,8 @@ class HCContinuousExtractor:
 
         def log_summary(state: str, total: int = 0) -> None:
             logger.info(
-                "[HC] Search summary: state=%s court=%s type=%s year=%d status=%s result=%s total=%d attempts=%d solved=%d rejected=%d empty=%d no_image=%d transport=%d",
-                state_code,
-                court_code,
-                case_type_code,
-                year,
-                case_status,
+                "[HC] Search summary: target=%s result=%s total=%d attempts=%d solved=%d rejected=%d empty=%d no_image=%d transport=%d",
+                target_label,
                 state,
                 total,
                 stats["attempts"],
