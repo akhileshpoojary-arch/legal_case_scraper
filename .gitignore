@@ -19,3 +19,5 @@ captcha_img/
 .vscode/
 .idea/
 AppScriptCode/
+
+venv311/
