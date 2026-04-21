@@ -9,7 +9,6 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
-from daily_run.config import TESTING
 from utils.session_utils import SessionManager
 
 logger = logging.getLogger("legal_scraper.daily_run.sc.extractor")
@@ -88,11 +87,33 @@ class SCIContinuousExtractor:
         self._sm = session_manager
         self._detail_sessions = detail_sessions or [session_manager]
         self._detail_rr = 0
+        self._search_metrics: dict[str, int] = {
+            "attempts": 0,
+            "captcha_solved": 0,
+            "captcha_rejected": 0,
+            "captcha_empty": 0,
+            "captcha_image_missing": 0,
+            "retryable_errors": 0,
+            "transport_failures": 0,
+            "search_hits": 0,
+            "no_records": 0,
+            "captcha_exhausted": 0,
+            "hard_failures": 0,
+        }
 
     def _pick_detail_sm(self) -> SessionManager:
         sm = self._detail_sessions[self._detail_rr % len(self._detail_sessions)]
         self._detail_rr += 1
         return sm
+
+    def _metric_inc(self, key: str, value: int = 1) -> None:
+        self._search_metrics[key] = self._search_metrics.get(key, 0) + value
+
+    def drain_search_metrics(self) -> dict[str, int]:
+        snapshot = dict(self._search_metrics)
+        for k in self._search_metrics:
+            self._search_metrics[k] = 0
+        return snapshot
 
     @property
     def case_types(self) -> list[dict[str, str]]:
@@ -141,34 +162,24 @@ class SCIContinuousExtractor:
         If the model's prediction is wrong, fetches a new captcha and retries.
         Returns the parsed response dict or None if no record.
         """
-        from utils.captcha import solve as captcha_solve
-
-        loop = asyncio.get_event_loop()
+        from utils.captcha import solve_async as captcha_solve_async
 
         for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
+            self._metric_inc("attempts")
             img_bytes = await self._download_captcha_bytes(scid)
             if not img_bytes:
+                self._metric_inc("captcha_image_missing")
+                await asyncio.sleep(0.05)
                 continue
-
-            if TESTING:
-                logger.info(
-                    "[SCI] Captcha: Solving image (%d bytes)...", len(img_bytes)
-                )
 
             # Type 2 model directly predicts the numeric answer
-            captcha_val = await loop.run_in_executor(
-                None, captcha_solve, img_bytes, 6, "sci"
-            )
+            captcha_val = await captcha_solve_async(img_bytes, 6, "sci")
 
             if not captcha_val:
-                logger.warning("[SCI] Captcha: Model returned empty prediction.")
+                self._metric_inc("captcha_empty")
                 continue
 
-            if TESTING:
-                logger.info(
-                    "[SCI] Captcha: Model predicted '%s' (attempt %d/%d)",
-                    captcha_val, attempt, MAX_CAPTCHA_RETRIES,
-                )
+            self._metric_inc("captcha_solved")
 
             params = {
                 "case_type": case_type,
@@ -191,7 +202,9 @@ class SCIContinuousExtractor:
             )
 
             if not resp:
-                break
+                self._metric_inc("transport_failures")
+                self._metric_inc("retryable_errors")
+                return {"_search_state": "retryable_error"}
 
             success = resp.get("success", False)
             data = resp.get("data", "")
@@ -207,27 +220,23 @@ class SCIContinuousExtractor:
                     is_captcha_err = True
 
                 if is_captcha_err:
-                    if TESTING:
-                        logger.info(
-                            "[SCI] Captcha '%s' rejected, refreshing image...",
-                            captcha_val,
-                        )
+                    self._metric_inc("captcha_rejected")
+                    await asyncio.sleep(min(0.2 + random.random() * 0.3, 0.5))
                     continue
 
                 if isinstance(data, str) and (
                     "timeout" in data.lower() or "try again" in data.lower()
                 ):
+                    self._metric_inc("retryable_errors")
                     return {"_search_state": "retryable_error"}
 
                 if isinstance(data, str) and "no records" in data.lower():
-                    if TESTING:
-                        logger.info(
-                            "[SCI] Search no records case=%s/%s/%s",
-                            case_type, case_no, year,
-                        )
+                    self._metric_inc("no_records")
                     return None
 
-                return None
+                self._metric_inc("hard_failures")
+                self._metric_inc("retryable_errors")
+                return {"_search_state": "retryable_error"}
 
             from utils.captcha import save_captcha_image
 
@@ -240,30 +249,20 @@ class SCIContinuousExtractor:
                 results_html = data
 
             if "No records found" in results_html or "notfound" in results_html:
-                if TESTING:
-                    logger.info(
-                        "[SCI] Search no records(html) case=%s/%s/%s",
-                        case_type, case_no, year,
-                    )
+                self._metric_inc("no_records")
                 return None
 
             row_data = self._extract_result_row(results_html)
             if row_data:
-                if TESTING:
-                    logger.info(
-                        "[SCI] Search success case=%s/%s/%s diary=%s/%s",
-                        case_type, case_no, year,
-                        row_data.get("diary_no", ""),
-                        row_data.get("diary_year", ""),
-                    )
-                    logger.info(
-                        "-------------------------------------------------------------------"
-                    )
+                self._metric_inc("search_hits")
                 return row_data
 
-            return None
+            self._metric_inc("hard_failures")
+            self._metric_inc("retryable_errors")
+            return {"_search_state": "retryable_error"}
 
-        return None
+        self._metric_inc("captcha_exhausted")
+        return {"_search_state": "captcha_error"}
 
     def _extract_result_row(self, html: str) -> dict | None:
         """Extract case data from the search result HTML table."""

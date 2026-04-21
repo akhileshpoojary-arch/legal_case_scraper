@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -45,14 +46,31 @@ class CaptchaModelSolver:
     """Loads and runs Type 1 (CTC) and Type 2 (Classifier) Keras models."""
 
     def __init__(self) -> None:
-        import os
         os.environ.setdefault("KERAS_BACKEND", "tensorflow")
+        # Keep TensorFlow quiet and constrained in CPU-only containers.
+        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+        os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+        os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
 
         import tensorflow as tf
         import keras
         from keras import layers
 
+        try:
+            tf.config.threading.set_intra_op_parallelism_threads(
+                max(1, int(os.environ.get("TF_NUM_INTRAOP_THREADS", "1")))
+            )
+            tf.config.threading.set_inter_op_parallelism_threads(
+                max(1, int(os.environ.get("TF_NUM_INTEROP_THREADS", "1")))
+            )
+        except Exception:
+            # Thread config can be immutable in some TF builds; safe to ignore.
+            pass
+
         self._tf = tf
+        self._predict_semaphore = threading.BoundedSemaphore(
+            max(1, int(os.environ.get("CAPTCHA_MODEL_MAX_CONCURRENCY", "2")))
+        )
 
         # ── Type 1: CTC text recognition (DC/HC) ──
         t1_path = _BUNDLE_DIR / "type1"
@@ -85,6 +103,13 @@ class CaptchaModelSolver:
         logger.info(
             "  ✓ Type 2 loaded | num_classes=%d", self._t2_num_classes,
         )
+
+        # Warm-up once to reduce first-request latency and avoid repeated tracing.
+        try:
+            _ = self._t1_model(np.zeros((1, IMG_W, IMG_H, 1), dtype=np.float32), training=False)
+            _ = self._t2_model(np.zeros((1, IMG_H, IMG_W, 1), dtype=np.float32), training=False)
+        except Exception:
+            pass
 
     # ─── Preprocessing ────────────────────────────────────────────
 
@@ -143,11 +168,11 @@ class CaptchaModelSolver:
         Returns 6-char lowercase alphanumeric string, or empty string on failure.
         """
         try:
-            arr = np.array(
-                [self._preprocess_type1(image_bytes)], dtype=np.float32
-            )
-            pred = self._t1_model.predict(arr, verbose=0)
-            texts = self._decode_ctc(pred)
+            arr = np.array([self._preprocess_type1(image_bytes)], dtype=np.float32)
+            with self._predict_semaphore:
+                pred_raw = self._t1_model(arr, training=False)
+            pred = pred_raw.numpy() if hasattr(pred_raw, "numpy") else pred_raw
+            texts = self._decode_ctc(pred)  # type: ignore[arg-type]
             result = texts[0] if texts else ""
             logger.debug("  [Model T1] predicted: '%s'", result)
             return result
@@ -162,10 +187,10 @@ class CaptchaModelSolver:
         Returns numeric answer string, or empty string on failure.
         """
         try:
-            arr = np.array(
-                [self._preprocess_type2(image_bytes)], dtype=np.float32
-            )
-            pred = self._t2_model.predict(arr, verbose=0)
+            arr = np.array([self._preprocess_type2(image_bytes)], dtype=np.float32)
+            with self._predict_semaphore:
+                pred_raw = self._t2_model(arr, training=False)
+            pred = pred_raw.numpy() if hasattr(pred_raw, "numpy") else pred_raw
             answer = str(int(np.argmax(pred[0])))
             logger.debug("  [Model T2] predicted: '%s'", answer)
             return answer

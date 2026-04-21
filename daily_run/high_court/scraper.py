@@ -24,8 +24,8 @@ from daily_run.config import (
     HC_PROGRESS_FILE,
     HC_SEARCH_WORKERS,
     HC_DETAIL_WORKERS,
+    SHEET_FLUSH_CASES,
     HC_TELEMETRY_EVERY,
-    HC_WRITE_BATCH_SIZE,
     HC_START_YEAR,
     SYSTEM_SHARD_ID,
 )
@@ -224,7 +224,7 @@ class HCContinuousScraper:
                 worker_count = max(1, int(HC_SEARCH_WORKERS))
                 detail_limit = max(1, int(HC_DETAIL_WORKERS))
                 telemetry_every = max(20, int(HC_TELEMETRY_EVERY))
-                write_batch_size = max(1, int(HC_WRITE_BATCH_SIZE))
+                write_batch_size = max(1, int(SHEET_FLUSH_CASES))
 
                 queue: asyncio.Queue[dict | None] = asyncio.Queue()
                 pending_detail_tasks: set[asyncio.Task[dict | None]] = set()
@@ -236,9 +236,20 @@ class HCContinuousScraper:
                     "selected_case_type": ct.get("type_name", ""),
                 }
 
-                cases, count = await self._extractor.search_cases_by_type(
+                cases, count, search_state = await self._extractor.search_cases_by_type(
                     state_code, court_code, yr, case_type_code, target_status
                 )
+                if search_state == "retryable_error":
+                    logger.warning(
+                        "[HC] Search unstable for state=%s court=%s type=%s year=%d status=%s; retrying same block.",
+                        state_code,
+                        court_code,
+                        case_type_code,
+                        yr,
+                        target_status,
+                    )
+                    await asyncio.sleep(3)
+                    continue
 
                 async def enqueue_worker(worker_idx: int) -> None:
                     for idx in range(worker_idx, len(cases), worker_count):
@@ -380,13 +391,9 @@ class HCContinuousScraper:
                 written_total += await flush_write_buffer(force=True)
                 search_elapsed = time.monotonic() - search_started
                 logger.info(
-                    "Found %d cases. Search+pipeline stage took %.2fs.",
+                    "[HC] Stage summary: total=%.2fs search_total=%d detail_ok=%d detail_fail=%d written=%d",
+                    search_elapsed,
                     count,
-                    search_elapsed,
-                )
-                logger.info(
-                    "[HC] Stage timings: total=%.2fs detail_ok=%d detail_fail=%d written=%d",
-                    search_elapsed,
                     detail_success_total,
                     detail_failure_total,
                     written_total,

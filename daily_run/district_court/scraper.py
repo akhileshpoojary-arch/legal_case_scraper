@@ -22,13 +22,12 @@ from daily_run.config import (
     DC_DETAIL_WORKERS,
     DC_END_YEAR,
     DC_SEARCH_WORKERS,
+    SHEET_FLUSH_CASES,
     DC_TELEMETRY_EVERY,
-    DC_WRITE_BATCH_SIZE,
     DC_PROGRESS_FILE,
     DC_START_YEAR,
     DETAIL_SESSION_POOL_SIZE,
     SYSTEM_SHARD_ID,
-    DC_MIN_WRITE_SIZE,
 )
 from daily_run.district_court.extractor import DCContinuousExtractor, DC_STATES
 from daily_run.district_court.parser import build_dc_row, parse_detail_html
@@ -291,7 +290,7 @@ class DCContinuousScraper:
                 worker_count = max(1, int(DC_SEARCH_WORKERS))
                 detail_limit = max(1, int(DC_DETAIL_WORKERS))
                 telemetry_every = max(20, int(DC_TELEMETRY_EVERY))
-                write_batch_size = max(1, int(DC_WRITE_BATCH_SIZE))
+                write_batch_size = max(1, int(SHEET_FLUSH_CASES))
 
                 queue: asyncio.Queue[dict | None] = asyncio.Queue()
                 pending_detail_tasks: set[asyncio.Task[dict]] = set()
@@ -304,7 +303,7 @@ class DCContinuousScraper:
                     "selected_case_type": case_type_name,
                 }
 
-                cases, count = await self._extractor.search_cases_by_type(
+                cases, count, search_state = await self._extractor.search_cases_by_type(
                     state_code,
                     dist_code,
                     cplx_code,
@@ -313,6 +312,19 @@ class DCContinuousScraper:
                     case_type_code,
                     target_status,
                 )
+                if search_state == "retryable_error":
+                    logger.warning(
+                        "[DC] Search unstable for state=%s dist=%s complex=%s est=%s type=%s year=%d status=%s; retrying same block.",
+                        state_code,
+                        dist_code,
+                        cplx_code,
+                        est_code,
+                        case_type_code,
+                        yr,
+                        target_status,
+                    )
+                    await asyncio.sleep(3)
+                    continue
 
                 async def enqueue_worker(worker_idx: int) -> None:
                     for idx in range(worker_idx, len(cases), worker_count):
@@ -388,7 +400,7 @@ class DCContinuousScraper:
                     detail_success_total += s
                     detail_failure_total += f
                     pending.extend(rows)
-                    while len(pending) >= max(DC_MIN_WRITE_SIZE, write_batch_size):
+                    while len(pending) >= write_batch_size:
                         chunk = pending[:write_batch_size]
                         await self._sheets.write_cases("dc", chunk)
                         written_total += len(chunk)
@@ -435,7 +447,7 @@ class DCContinuousScraper:
                         detail_success_total += s
                         detail_failure_total += f
                         pending.extend(rows)
-                        while len(pending) >= max(DC_MIN_WRITE_SIZE, write_batch_size):
+                        while len(pending) >= write_batch_size:
                             chunk = pending[:write_batch_size]
                             await self._sheets.write_cases("dc", chunk)
                             written_total += len(chunk)
@@ -459,11 +471,9 @@ class DCContinuousScraper:
 
                 search_elapsed = time.monotonic() - search_started
                 logger.info(
-                    "Found %d cases. Search+pipeline stage took %.2fs.", count, search_elapsed
-                )
-                logger.info(
-                    "[DC] Stage timings: total=%.2fs detail_ok=%d detail_fail=%d pending_buffer=%d written=%d",
+                    "[DC] Stage summary: total=%.2fs search_total=%d detail_ok=%d detail_fail=%d pending_buffer=%d written=%d",
                     search_elapsed,
+                    count,
                     detail_success_total,
                     detail_failure_total,
                     len(pending),

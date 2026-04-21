@@ -8,15 +8,21 @@ Uses custom-trained Keras models:
 
 from __future__ import annotations
 
-import io
+import asyncio
 import logging
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
 
 import requests as req
 
 logger = logging.getLogger("legal_scraper.captcha")
+
+_CAPTCHA_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(1, int(os.environ.get("CAPTCHA_EXECUTOR_WORKERS", "2"))),
+    thread_name_prefix="captcha",
+)
 
 
 def warm_up_reader() -> None:
@@ -50,6 +56,21 @@ def solve(image_bytes: bytes, expected_length: int = 6, prefix: str = "hc") -> s
     except Exception as exc:
         logger.warning("CAPTCHA solve failed (model): %s", exc)
         return ""
+
+
+async def solve_async(
+    image_bytes: bytes,
+    expected_length: int = 6,
+    prefix: str = "hc",
+) -> str:
+    """
+    Async wrapper around solve() using a dedicated, bounded thread pool.
+    This prevents unbounded default-executor growth under heavy parallel load.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _CAPTCHA_EXECUTOR, solve, image_bytes, expected_length, prefix
+    )
 
 
 def download_and_solve(

@@ -270,31 +270,58 @@ class HCContinuousExtractor:
         year: int,
         case_type_code: str,
         case_status: str,
-    ) -> tuple[list[dict], int]:
-        from utils.captcha import solve as captcha_solve
+    ) -> tuple[list[dict], int, str]:
+        from utils.captcha import solve_async as captcha_solve_async
 
         consecutive_error_val = 0
+        stats = {
+            "attempts": 0,
+            "captcha_image_missing": 0,
+            "captcha_empty": 0,
+            "captcha_solved": 0,
+            "captcha_rejected": 0,
+            "transport_failures": 0,
+            "session_refresh": 0,
+            "no_records": 0,
+            "retry_exhausted": 0,
+            "error_val_cutoff": 0,
+        }
+
+        def log_summary(state: str, total: int = 0) -> None:
+            logger.info(
+                "[HC] Search summary: state=%s court=%s type=%s year=%d status=%s result=%s total=%d attempts=%d solved=%d rejected=%d empty=%d no_image=%d transport=%d",
+                state_code,
+                court_code,
+                case_type_code,
+                year,
+                case_status,
+                state,
+                total,
+                stats["attempts"],
+                stats["captcha_solved"],
+                stats["captcha_rejected"],
+                stats["captcha_empty"],
+                stats["captcha_image_missing"],
+                stats["transport_failures"],
+            )
 
         for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
+            stats["attempts"] += 1
             if attempt > 1:
                 await asyncio.sleep(min(2 * (1 + random.random()), 6))
 
             img_bytes = await self._download_captcha_bytes()
             if not img_bytes:
+                stats["captcha_image_missing"] += 1
                 continue
 
-            loop = asyncio.get_event_loop()
-            if TESTING:
-                logger.info("[HC] Captcha: Solving image (%d bytes)...", len(img_bytes))
-
-            captcha = await loop.run_in_executor(None, captcha_solve, img_bytes)
+            captcha = await captcha_solve_async(img_bytes, 6, "hc")
 
             if not captcha:
-                logger.warning("[HC] Captcha: Solver returned empty result.")
+                stats["captcha_empty"] += 1
                 continue
 
-            if TESTING:
-                logger.info("[HC] Captcha: Solved as '%s'", captcha)
+            stats["captcha_solved"] += 1
 
             payload = {
                 "court_code": court_code,
@@ -318,19 +345,23 @@ class HCContinuousExtractor:
 
             if not text:
                 consecutive_error_val = 0
+                stats["transport_failures"] += 1
                 continue
 
             clean = text.strip().lstrip("\ufeff").strip()
             status = _classify_response(text)
 
             if status == "captcha_error":
+                stats["captcha_rejected"] += 1
                 is_error_val = (
                     '"Error":"ERROR_VAL"' in clean or '"Error": "ERROR_VAL"' in clean
                 )
                 if is_error_val:
                     consecutive_error_val += 1
                     if consecutive_error_val >= 2:
-                        return [], 0
+                        stats["error_val_cutoff"] += 1
+                        log_summary("no_results", 0)
+                        return [], 0, "no_results"
                 else:
                     consecutive_error_val = 0
                 continue
@@ -338,22 +369,32 @@ class HCContinuousExtractor:
             consecutive_error_val = 0
 
             if status == "session_expired":
+                stats["session_refresh"] += 1
                 await self._sm.force_refresh(HC_HOME, HC_HEADERS)
                 continue
 
             if status == "no_results":
-                return [], 0
+                stats["no_records"] += 1
+                log_summary("no_results", 0)
+                return [], 0, "no_results"
 
             from utils.captcha import save_captcha_image
 
             save_captcha_image(img_bytes, captcha, "hc")
 
-            data = json.loads(clean)
+            try:
+                data = json.loads(clean)
+            except Exception:
+                stats["transport_failures"] += 1
+                continue
             cases = _parse_con_field(data)
             total = int(data.get("totRecords", len(cases)))
-            return cases, total
+            log_summary("ok", total)
+            return cases, total, "ok"
 
-        return [], 0
+        stats["retry_exhausted"] += 1
+        log_summary("retryable_error", 0)
+        return [], 0, "retryable_error"
 
     async def fetch_case_detail(
         self,

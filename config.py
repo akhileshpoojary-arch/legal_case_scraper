@@ -16,7 +16,14 @@ from pathlib import Path
 # ═══════════════════════════════════════════════════════════════
 #  MODE
 # ═══════════════════════════════════════════════════════════════
-TESTING = True
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+TESTING = _env_bool("TESTING", False)
 
 # ═══════════════════════════════════════════════════════════════
 #  ACTIVE SCRAPERS  (only these run when main.py is executed)
@@ -73,7 +80,7 @@ SCRAPER_RESULT_CELLS: dict[str, str] = {
 # ═══════════════════════════════════════════════════════════════
 #  CONCURRENCY  (env-driven for Railway auto-scaling)
 # ═══════════════════════════════════════════════════════════════
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 50))
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 30))
 REQUEST_DELAY = 0.01
 MAX_RETRIES = 5
 RETRY_DELAY = 1.0

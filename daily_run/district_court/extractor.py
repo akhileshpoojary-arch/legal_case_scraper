@@ -275,8 +275,8 @@ class DCContinuousExtractor:
         year: int,
         case_type_code: str,
         case_status: str,
-    ) -> Tuple[list[dict], int]:
-        from utils.captcha import solve as captcha_solve
+    ) -> Tuple[list[dict], int, str]:
+        from utils.captcha import solve_async as captcha_solve_async
 
         cplx_base = complex_code.split("@")[0] if "@" in complex_code else complex_code
 
@@ -296,35 +296,66 @@ class DCContinuousExtractor:
         )
 
         consec_fail = 0
+        stats = {
+            "attempts": 0,
+            "captcha_image_missing": 0,
+            "captcha_empty": 0,
+            "captcha_solved": 0,
+            "captcha_rejected": 0,
+            "transport_failures": 0,
+            "parse_failures": 0,
+            "retry_exhausted": 0,
+            "consecutive_fail_cutoff": 0,
+        }
+
+        def log_summary(state: str, total: int = 0) -> None:
+            logger.info(
+                "[DC] Search summary: state=%s dist=%s complex=%s est=%s type=%s year=%d status=%s result=%s total=%d attempts=%d solved=%d rejected=%d empty=%d no_image=%d transport=%d parse=%d",
+                state_code,
+                dist_code,
+                cplx_base,
+                est_code,
+                case_type_code,
+                year,
+                case_status,
+                state,
+                total,
+                stats["attempts"],
+                stats["captcha_solved"],
+                stats["captcha_rejected"],
+                stats["captcha_empty"],
+                stats["captcha_image_missing"],
+                stats["transport_failures"],
+                stats["parse_failures"],
+            )
 
         for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
+            stats["attempts"] += 1
             if attempt > 1:
                 await asyncio.sleep(min(2 * (1 + random.random()), 6))
 
             img_bytes = await self._download_captcha_bytes()
             if not img_bytes:
+                stats["captcha_image_missing"] += 1
                 consec_fail += 1
                 if consec_fail >= MAX_CAPTCHA_CONSEC_FAILS:
-                    return [], 0
+                    stats["consecutive_fail_cutoff"] += 1
+                    log_summary("retryable_error", 0)
+                    return [], 0, "retryable_error"
                 continue
 
-            loop = asyncio.get_event_loop()
-            if TESTING:
-                logger.info("[DC] Captcha: Solving image (%d bytes)...", len(img_bytes))
-
-            captcha = await loop.run_in_executor(
-                None, captcha_solve, img_bytes, 6, "dc"
-            )
+            captcha = await captcha_solve_async(img_bytes, 6, "dc")
 
             if not captcha:
-                logger.warning("[DC] Captcha: Solver returned empty result.")
+                stats["captcha_empty"] += 1
                 consec_fail += 1
                 if consec_fail >= MAX_CAPTCHA_CONSEC_FAILS:
-                    return [], 0
+                    stats["consecutive_fail_cutoff"] += 1
+                    log_summary("retryable_error", 0)
+                    return [], 0, "retryable_error"
                 continue
 
-            if TESTING:
-                logger.info("[DC] Captcha: Solved as '%s'", captcha)
+            stats["captcha_solved"] += 1
 
             payload = (
                 f"case_type_1={quote(case_type_code)}"
@@ -348,14 +379,18 @@ class DCContinuousExtractor:
             )
 
             if not text:
+                stats["transport_failures"] += 1
                 consec_fail += 1
                 if consec_fail >= MAX_CAPTCHA_CONSEC_FAILS:
-                    return [], 0
+                    stats["consecutive_fail_cutoff"] += 1
+                    log_summary("retryable_error", 0)
+                    return [], 0, "retryable_error"
                 continue
 
             try:
                 data = json.loads(text)
             except Exception:
+                stats["parse_failures"] += 1
                 consec_fail += 1
                 continue
 
@@ -364,15 +399,19 @@ class DCContinuousExtractor:
                 or "invalid captcha" in str(data).lower()
                 or '<div class="alert alert-danger' in text
             ):
+                stats["captcha_rejected"] += 1
                 consec_fail += 1
                 if consec_fail >= MAX_CAPTCHA_CONSEC_FAILS:
-                    return [], 0
+                    stats["consecutive_fail_cutoff"] += 1
+                    log_summary("retryable_error", 0)
+                    return [], 0, "retryable_error"
                 continue
 
             # DC endpoint can return either `case_data` or `party_data`.
             party_data = data.get("case_data") or data.get("party_data", "")
             if "Total number of cases : 0" in party_data or not party_data:
-                return [], 0
+                log_summary("no_results", 0)
+                return [], 0, "no_results"
 
             from utils.captcha import save_captcha_image
 
@@ -416,9 +455,12 @@ class DCContinuousExtractor:
                                 }
                             )
 
-            return cases, len(cases)
+            log_summary("ok", len(cases))
+            return cases, len(cases), "ok"
 
-        return [], 0
+        stats["retry_exhausted"] += 1
+        log_summary("retryable_error", 0)
+        return [], 0, "retryable_error"
 
     async def fetch_case_detail(
         self,

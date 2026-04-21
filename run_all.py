@@ -8,7 +8,9 @@ court websites with independent HTTP sessions.
 
 import asyncio
 import logging
+import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 from daily_run.district_court.scraper import DCContinuousScraper
 from daily_run.high_court.scraper import HCContinuousScraper
@@ -22,6 +24,12 @@ async def main() -> None:
     logger.info("=" * 60)
     logger.info("  LEGAL CASE SCRAPER — ALL COURTS (Railway)")
     logger.info("=" * 60)
+    loop = asyncio.get_running_loop()
+    max_workers = max(4, int(os.environ.get("DEFAULT_EXECUTOR_WORKERS", "8")))
+    loop.set_default_executor(
+        ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="defaultio")
+    )
+    logger.info("Configured default executor workers=%d", max_workers)
 
     dc = DCContinuousScraper()
     hc = HCContinuousScraper()

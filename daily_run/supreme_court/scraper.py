@@ -22,8 +22,8 @@ from daily_run.config import (
     SC_MAX_CONSECUTIVE_FAILURES,
     SC_PROGRESS_FILE,
     SC_SEARCH_WORKERS,
+    SHEET_FLUSH_CASES,
     SC_START_YEAR,
-    SC_WRITE_BATCH_SIZE,
     SYSTEM_SHARD_ID,
 )
 from daily_run.supreme_court.extractor import SCI_CASE_TYPES, SCIContinuousExtractor
@@ -207,6 +207,9 @@ class SCContinuousScraper:
                 result_queue: asyncio.Queue[tuple[dict[str, Any], int] | None] = asyncio.Queue()
                 progress_flush_every = max(10, worker_count * 5)
                 search_tick = 0
+                detail_success_total = 0
+                detail_failure_total = 0
+                written_total = 0
 
                 async def build_case_row(
                     case_result: dict[str, Any],
@@ -227,7 +230,7 @@ class SCContinuousScraper:
                     return row
 
                 async def drain_completed_details(block: bool = False) -> None:
-                    nonlocal batch_results
+                    nonlocal batch_results, detail_success_total, detail_failure_total, written_total
                     if not pending_detail_tasks:
                         return
 
@@ -248,25 +251,28 @@ class SCContinuousScraper:
                             row = task.result()
                         except Exception:
                             logger.exception("[SC] Detail task failed.")
+                            detail_failure_total += 1
                             continue
                         if not row:
+                            detail_failure_total += 1
                             continue
+                        detail_success_total += 1
                         batch_results.append(row)
 
-                    while len(batch_results) >= SC_WRITE_BATCH_SIZE:
-                        chunk = batch_results[:SC_WRITE_BATCH_SIZE]
+                    while len(batch_results) >= SHEET_FLUSH_CASES:
+                        chunk = batch_results[:SHEET_FLUSH_CASES]
                         logger.info(
                             "[SC] Writing batch of %d cases to Google Sheet...",
                             len(chunk),
                         )
                         write_started = time.monotonic()
-                        await self._sheets.write_cases("sc", chunk)
+                        written_total += await self._sheets.write_cases("sc", chunk)
                         logger.info(
                             "[SC] Batch write took %.2fs for %d rows",
                             time.monotonic() - write_started,
                             len(chunk),
                         )
-                        del batch_results[:SC_WRITE_BATCH_SIZE]
+                        del batch_results[:SHEET_FLUSH_CASES]
 
                 async def sc_search_worker(
                     worker_idx: int,
@@ -371,18 +377,49 @@ class SCContinuousScraper:
                         len(batch_results),
                     )
                     write_started = time.monotonic()
-                    await self._sheets.write_cases("sc", batch_results)
+                    written_total += await self._sheets.write_cases("sc", batch_results)
                     logger.info(
                         "[SC] Remaining write took %.2fs for %d rows",
                         time.monotonic() - write_started,
                         len(batch_results),
                     )
                 search_elapsed = time.monotonic() - search_started
+                captcha_totals = {
+                    "attempts": 0,
+                    "captcha_solved": 0,
+                    "captcha_rejected": 0,
+                    "captcha_empty": 0,
+                    "captcha_image_missing": 0,
+                    "retryable_errors": 0,
+                    "transport_failures": 0,
+                    "search_hits": 0,
+                    "no_records": 0,
+                    "captcha_exhausted": 0,
+                    "hard_failures": 0,
+                }
+                for ex in search_workers:
+                    metrics = ex.drain_search_metrics()
+                    for key, value in metrics.items():
+                        captcha_totals[key] = captcha_totals.get(key, 0) + int(value)
+
                 logger.info(
-                    "[SC] Stage timings: search+detail=%.2fs year=%d type=%s",
+                    "[SC] Captcha summary: attempts=%d solved=%d rejected=%d empty=%d no_image=%d exhausted=%d retryable=%d",
+                    captcha_totals["attempts"],
+                    captcha_totals["captcha_solved"],
+                    captcha_totals["captcha_rejected"],
+                    captcha_totals["captcha_empty"],
+                    captcha_totals["captcha_image_missing"],
+                    captcha_totals["captcha_exhausted"],
+                    captcha_totals["retryable_errors"],
+                )
+                logger.info(
+                    "[SC] Stage summary: duration=%.2fs search_hits=%d detail_ok=%d detail_fail=%d written=%d no_records=%d",
                     search_elapsed,
-                    year,
-                    ct_name,
+                    consumed_results,
+                    detail_success_total,
+                    detail_failure_total,
+                    written_total,
+                    captcha_totals["no_records"],
                 )
 
                 logger.info(

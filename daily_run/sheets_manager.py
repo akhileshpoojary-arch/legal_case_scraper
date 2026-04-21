@@ -47,9 +47,30 @@ class DailyRunSheetsManager:
     def __init__(self) -> None:
         import gspread
 
-        self._gc = gspread.service_account(filename=str(SERVICE_ACCOUNT_FILE))
-        self._index_sh = self._gc.open_by_key(INDEX_SHEET_ID)
-        self._index_ws = self._index_sh.worksheet("All court")
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                self._gc = gspread.service_account(filename=str(SERVICE_ACCOUNT_FILE))
+                self._index_sh = self._gc.open_by_key(INDEX_SHEET_ID)
+                self._index_ws = self._index_sh.worksheet("All court")
+                break
+            except Exception as e:
+                reason = DailyRunSheetsManager._extract_error_reason(e)
+                if reason in _NON_RETRYABLE_REASONS:
+                    logger.error("Sheets startup failed (non-retryable): %s", e)
+                    raise
+                delay = min(_RETRY_BASE_DELAY * (2 ** min(attempt - 1, 6)), 300)
+                if DailyRunSheetsManager._is_rate_limit_error(e):
+                    delay = max(delay, _RATE_LIMIT_MIN_DELAY + random.uniform(0.0, 5.0))
+                logger.warning(
+                    "Sheets startup attempt %d failed: %s. Retrying in %ds.",
+                    attempt,
+                    e,
+                    int(delay),
+                )
+                time.sleep(delay)
+
         self._locks = {k: asyncio.Lock() for k in _COURT_COL_MAP}
         self._header_cache: dict[str, list[str]] = {}
         self._case_col_cache: dict[str, int | None] = {}
