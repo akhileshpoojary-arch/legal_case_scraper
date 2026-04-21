@@ -1,0 +1,21 @@
+# Secrets — never commit
+service_account.json
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Runtime data
+captcha_img/
+.dedup_cache/
+*_progress_*.json
+
+# IDE
+.vscode/
+.idea/
+AppScriptCode/
