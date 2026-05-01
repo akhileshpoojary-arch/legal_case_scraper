@@ -5,6 +5,8 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger("legal_scraper.daily_run.cluster")
@@ -254,3 +256,147 @@ def slice_for_shard(
     start = (sid - 1) * n // total_shards
     end = sid * n // total_shards
     return items[start:end]
+
+
+@dataclass(slots=True)
+class PipelineStats:
+    """Counters returned by the bounded case-detail pipeline."""
+
+    search_total: int
+    detail_started: int = 0
+    detail_success: int = 0
+    detail_failure: int = 0
+    duplicates_skipped: int = 0
+    written: int = 0
+
+
+async def bounded_detail_pipeline(
+    *,
+    items: Sequence[Any],
+    build_row: Callable[[Any], Awaitable[dict[str, Any] | None]],
+    write_rows: Callable[[list[dict[str, Any]]], Awaitable[int]],
+    detail_limit: int,
+    write_batch_size: int,
+    telemetry_every: int,
+    logger: logging.Logger,
+    log_prefix: str,
+    target_label: str,
+    worker_label: str,
+    key_func: Callable[[Any], str] | None = None,
+    task_timeout_seconds: float = 600.0,
+    session_written_base: int = 0,
+) -> PipelineStats:
+    """
+    Build detail rows with bounded concurrency and bounded write buffering.
+
+    HC/DC searches return a list of summary rows. The old scraper first enqueued
+    the full list and only then began detail work, which delayed every write and
+    duplicated memory. This helper starts detail requests immediately, caps
+    in-flight tasks, and writes rows as soon as a batch is ready.
+    """
+
+    detail_limit = max(1, int(detail_limit))
+    write_batch_size = max(1, int(write_batch_size))
+    telemetry_every = max(1, int(telemetry_every))
+    task_timeout_seconds = max(1.0, float(task_timeout_seconds))
+
+    stats = PipelineStats(search_total=len(items))
+    pending: set[asyncio.Task[dict[str, Any] | None]] = set()
+    write_buffer: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    async def timed_build(item: Any) -> dict[str, Any] | None:
+        return await asyncio.wait_for(build_row(item), timeout=task_timeout_seconds)
+
+    async def flush_write_buffer(force: bool = False) -> None:
+        while write_buffer and (force or len(write_buffer) >= write_batch_size):
+            take = len(write_buffer) if force else min(len(write_buffer), write_batch_size)
+            chunk = write_buffer[:take]
+            del write_buffer[:take]
+            stats.written += await write_rows(chunk)
+
+    async def drain_completed(block: bool = False) -> None:
+        if not pending:
+            return
+        if block:
+            done, _ = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        else:
+            done = {task for task in pending if task.done()}
+            if not done:
+                return
+
+        for task in done:
+            pending.discard(task)
+            try:
+                row = task.result()
+            except Exception:
+                stats.detail_failure += 1
+                continue
+            if row is None:
+                stats.detail_failure += 1
+                continue
+            stats.detail_success += 1
+            write_buffer.append(row)
+
+        await flush_write_buffer(force=False)
+
+    for item in items:
+        await drain_completed(block=False)
+
+        if key_func is not None:
+            key = key_func(item)
+            if key:
+                if key in seen_keys:
+                    stats.duplicates_skipped += 1
+                    continue
+                seen_keys.add(key)
+
+        task = asyncio.create_task(timed_build(item))
+        pending.add(task)
+        stats.detail_started += 1
+
+        if stats.detail_started % telemetry_every == 0:
+            detail_done = stats.detail_success + stats.detail_failure
+            detail_left = max(
+                stats.search_total - detail_done - stats.duplicates_skipped,
+                0,
+            )
+            logger.info(
+                "[%s] Pipeline telemetry: worker=%s target={%s} search_total=%d "
+                "detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d "
+                "detail_left=%d in_flight=%d write_buffer=%d/%d stage_written=%d "
+                "session_written=%d duplicate_skips=%d",
+                log_prefix,
+                worker_label,
+                target_label,
+                stats.search_total,
+                stats.detail_started,
+                detail_done,
+                stats.detail_success,
+                stats.detail_failure,
+                detail_left,
+                len(pending),
+                len(write_buffer),
+                write_batch_size,
+                stats.written,
+                session_written_base + stats.written,
+                stats.duplicates_skipped,
+            )
+
+        while len(pending) >= detail_limit:
+            await drain_completed(block=True)
+
+    if pending:
+        logger.info(
+            "[%s] Draining %d remaining detail tasks...",
+            log_prefix,
+            len(pending),
+        )
+    while pending:
+        await drain_completed(block=True)
+
+    await flush_write_buffer(force=True)
+    return stats

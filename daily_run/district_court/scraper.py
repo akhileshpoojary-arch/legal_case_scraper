@@ -16,12 +16,15 @@ from config import (
     PROXY_FILE,
     REQUEST_DELAY,
 )
-from daily_run.cluster import read_config_row_sync, slice_for_shard
+from daily_run.cluster import (
+    bounded_detail_pipeline,
+    read_config_row_sync,
+    slice_for_shard,
+)
 from daily_run.config import (
     CONFIG_WORKSHEET_NAME,
     DC_DETAIL_WORKERS,
     DC_END_YEAR,
-    DC_SEARCH_WORKERS,
     SHEET_FLUSH_CASES,
     DC_TELEMETRY_EVERY,
     DC_PROGRESS_FILE,
@@ -113,7 +116,6 @@ class DCContinuousScraper:
             "case_type_idx": 0,
             "year": DC_END_YEAR,
             "status_idx": 0,
-            "pending": [],
         }
 
     def _save_progress(self, prog: dict) -> None:
@@ -135,12 +137,11 @@ class DCContinuousScraper:
                 list(DC_STATES), SYSTEM_SHARD_ID, total
             )
             logger.info(
-                "[DC] Worker slice: worker=%s total_systems=%d shard_id=%d states=%d search_workers=%d detail_workers=%d",
+                "[DC] Worker slice: worker=%s total_systems=%d shard_id=%d states=%d detail_workers=%d",
                 WORKER_LABEL,
                 total,
                 SYSTEM_SHARD_ID,
                 len(self._states_slice),
-                max(1, int(DC_SEARCH_WORKERS)),
                 max(1, int(DC_DETAIL_WORKERS)),
             )
 
@@ -155,16 +156,17 @@ class DCContinuousScraper:
                     continue
 
                 prog = self._load_progress()
+                legacy_pending = prog.pop("pending", [])
+                if legacy_pending:
+                    logger.info(
+                        "[DC] Flushing %d legacy pending cases from progress file...",
+                        len(legacy_pending),
+                    )
+                    await self._sheets.write_cases("dc", legacy_pending)
+                    self._save_progress(prog)
                 s_idx = prog.get("state_idx", 0)
 
                 if s_idx >= len(states):
-                    # Flush any pending cases before starting over
-                    pending = prog.get("pending", [])
-                    if pending:
-                        logger.info("[DC] Flushing %d pending cases before reset...", len(pending))
-                        await self._sheets.write_cases("dc", pending)
-                        pending.clear()
-
                     prog = {
                         "state_idx": 0,
                         "dist_idx": 0,
@@ -173,7 +175,6 @@ class DCContinuousScraper:
                         "case_type_idx": 0,
                         "year": DC_END_YEAR,
                         "status_idx": 0,
-                        "pending": [],
                     }
                     self._save_progress(prog)
                     continue
@@ -321,13 +322,9 @@ class DCContinuousScraper:
                 )
 
                 search_started = time.monotonic()
-                worker_count = max(1, int(DC_SEARCH_WORKERS))
                 detail_limit = max(1, int(DC_DETAIL_WORKERS))
                 telemetry_every = max(20, int(DC_TELEMETRY_EVERY))
                 write_batch_size = max(1, int(SHEET_FLUSH_CASES))
-
-                queue: asyncio.Queue[dict | None] = asyncio.Queue()
-                pending_detail_tasks: set[asyncio.Task[dict]] = set()
 
                 court_info = {
                     "state_name": state["name"],
@@ -356,11 +353,6 @@ class DCContinuousScraper:
                     await asyncio.sleep(3)
                     continue
 
-                async def enqueue_worker(worker_idx: int) -> None:
-                    for idx in range(worker_idx, len(cases), worker_count):
-                        await queue.put(cases[idx])
-                    await queue.put(None)
-
                 async def build_row(case_data: dict) -> dict:
                     html = await self._extractor.fetch_case_detail(
                         state_code, dist_code, cplx_code, case_data
@@ -370,155 +362,44 @@ class DCContinuousScraper:
                     normalize_row(row)
                     return row
 
-                async def flush_details(block: bool = False) -> tuple[int, int, list[dict]]:
-                    if not pending_detail_tasks:
-                        return 0, 0, []
-                    if block:
-                        done, _ = await asyncio.wait(
-                            pending_detail_tasks, return_when=asyncio.FIRST_COMPLETED
-                        )
-                    else:
-                        done = {t for t in pending_detail_tasks if t.done()}
-                        if not done:
-                            return 0, 0, []
-                    success = 0
-                    failure = 0
-                    rows: list[dict] = []
-                    for task in done:
-                        pending_detail_tasks.discard(task)
-                        try:
-                            row = task.result()
-                        except Exception:
-                            # logger.exception("[DC] Detail task failed.")
-                            failure += 1
-                            continue
-                        success += 1
-                        rows.append(row)
-                    return success, failure, rows
+                async def write_rows(rows: list[dict[str, Any]]) -> int:
+                    return await self._sheets.write_cases("dc", rows)
 
-                search_tasks = [
-                    asyncio.create_task(enqueue_worker(i)) for i in range(worker_count)
-                ]
-                await asyncio.gather(*search_tasks)
+                def case_key(item: dict) -> str:
+                    return f"{item.get('cino', '')}::{item.get('case_no', '')}"
 
-                pending = prog.setdefault("pending", [])
-                seen_case_keys: set[str] = set()
-                finished_workers = 0
-                enqueued = 0
-                detail_success_total = 0
-                detail_failure_total = 0
-                written_total = 0
+                pipe_stats = await bounded_detail_pipeline(
+                    items=cases,
+                    build_row=build_row,
+                    write_rows=write_rows,
+                    detail_limit=detail_limit,
+                    write_batch_size=write_batch_size,
+                    telemetry_every=telemetry_every,
+                    logger=logger,
+                    log_prefix="DC",
+                    target_label=target_label,
+                    worker_label=WORKER_LABEL,
+                    key_func=case_key,
+                    session_written_base=self._session_written_total,
+                )
 
-                # Tracker for task start times
-                task_start_times: dict[asyncio.Task, float] = {}
-
-                async def monitor_stale_tasks():
-                    now = time.monotonic()
-                    for task, start_time in list(task_start_times.items()):
-                        if not task.done() and (now - start_time) > 600: # 10 minutes
-                            logger.warning("[DC] Cancelling stale detail task (elapsed %.1fs)", now - start_time)
-                            task.cancel()
-                            task_start_times.pop(task, None)
-                        elif task.done():
-                            task_start_times.pop(task, None)
-
-                while finished_workers < worker_count:
-                    await monitor_stale_tasks()
-                    # Non-blocking check for any finished tasks
-                    s, f, rows = await flush_details(block=False)
-                    detail_success_total += s
-                    detail_failure_total += f
-                    pending.extend(rows)
-                    while len(pending) >= write_batch_size:
-                        chunk = pending[:write_batch_size]
-                        await self._sheets.write_cases("dc", chunk)
-                        written_total += len(chunk)
-                        del pending[: len(chunk)]
-
-                    # Block until an item is available from the search workers (or they all finish)
-                    # We use a timeout to ensure we periodically check for finished tasks and stale tasks
-                    try:
-                        item = await asyncio.wait_for(queue.get(), timeout=10.0)
-                    except asyncio.TimeoutError:
-                        continue
-
-                    if item is None:
-                        finished_workers += 1
-                        continue
-
-                    case_key = f"{item.get('cino','')}::{item.get('case_no','')}"
-                    if case_key in seen_case_keys:
-                        continue
-                    seen_case_keys.add(case_key)
-
-                    # Start detail task
-                    task = asyncio.create_task(build_row(item))
-                    pending_detail_tasks.add(task)
-                    task_start_times[task] = time.monotonic()
-                    enqueued += 1
-
-                    # Telemetry
-                    if enqueued % telemetry_every == 0:
-                        detail_done = detail_success_total + detail_failure_total
-                        logger.info(
-                            "[DC] Pipeline telemetry: worker=%s target={%s} search_total=%d detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d detail_left=%d in_flight=%d buffer=%d/%d stage_written=%d session_written=%d",
-                            WORKER_LABEL,
-                            target_label,
-                            count,
-                            enqueued,
-                            detail_done,
-                            detail_success_total,
-                            detail_failure_total,
-                            max(count - detail_done, 0),
-                            len(pending_detail_tasks),
-                            len(pending),
-                            write_batch_size,
-                            written_total,
-                            self._session_written_total + written_total,
-                        )
-
-                    # If at concurrency limit, block until at least one task finishes
-                    while len(pending_detail_tasks) >= detail_limit:
-                        await monitor_stale_tasks()
-                        s, f, rows = await flush_details(block=True)
-                        detail_success_total += s
-                        detail_failure_total += f
-                        pending.extend(rows)
-                        while len(pending) >= write_batch_size:
-                            chunk = pending[:write_batch_size]
-                            await self._sheets.write_cases("dc", chunk)
-                            written_total += len(chunk)
-                            del pending[: len(chunk)]
-
-                # Final drain phase: Wait for all remaining detail tasks to finish
-                if pending_detail_tasks:
-                    logger.info("[DC] Draining %d remaining detail tasks...", len(pending_detail_tasks))
-                    while pending_detail_tasks:
-                        await monitor_stale_tasks()
-                        s, f, rows = await flush_details(block=True)
-                        detail_success_total += s
-                        detail_failure_total += f
-                        pending.extend(rows)
-
-                if pending:
-                    logger.info("[DC] Final flush: writing %d remaining cases...", len(pending))
-                    await self._sheets.write_cases("dc", pending)
-                    written_total += len(pending)
-                    pending.clear()
+                detail_success_total = pipe_stats.detail_success
+                detail_failure_total = pipe_stats.detail_failure
+                written_total = pipe_stats.written
 
                 search_elapsed = time.monotonic() - search_started
                 self._session_stage_total += 1
                 self._session_detail_total += detail_success_total
                 self._session_written_total += written_total
                 logger.info(
-                    "[DC] Stage summary: worker=%s target={%s} total=%.2fs search_total=%d detail_ok=%d detail_fail=%d pending_buffer=%d written=%d session_written=%d session_detail_ok=%d stages_done=%d",
+                    "[DC] Stage summary: worker=%s target={%s} total=%.2fs search_total=%d detail_ok=%d detail_fail=%d duplicate_skips=%d written=%d session_written=%d session_detail_ok=%d stages_done=%d",
                     WORKER_LABEL,
                     target_label,
                     search_elapsed,
                     count,
                     detail_success_total,
                     detail_failure_total,
-                    len(pending),
+                    pipe_stats.duplicates_skipped,
                     written_total,
                     self._session_written_total,
                     self._session_detail_total,

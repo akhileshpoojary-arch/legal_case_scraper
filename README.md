@@ -153,13 +153,16 @@ python3 run_sc.py
 
 - `MAX_CONCURRENT` (default `30`)
 - `DETAIL_SESSION_POOL_SIZE`
-- `DC_SEARCH_WORKERS`
-- `HC_SEARCH_WORKERS`
 - `SC_SEARCH_WORKERS`
 - `DC_DETAIL_WORKERS`
 - `HC_DETAIL_WORKERS`
 - `SHEET_FLUSH_CASES` (default `5000`)
 - `WRITE_BATCH_SIZE` (Sheets append chunking)
+- `DC_START_YEAR` / `DC_END_YEAR`
+- `HC_START_YEAR` / `HC_END_YEAR`
+- `SC_START_YEAR` / `SC_END_YEAR`
+- `SC_EMPTY_STREAK_STOP` (default `750`)
+- `SC_DETAIL_TABS` (`required` by default, use `all` for every SCI detail tab)
 
 ### Logging / mode
 
@@ -171,6 +174,9 @@ python3 run_sc.py
 - `TF_NUM_INTEROP_THREADS` (default `1`)
 - `CAPTCHA_MODEL_MAX_CONCURRENCY` (default `2`)
 - `CAPTCHA_EXECUTOR_WORKERS` (default `2`)
+- `CAPTCHA_TYPE1_MODEL_FILE` (default `model.keras`)
+- `CAPTCHA_TYPE2_MODEL_FILE` (default `model_best.keras` when present)
+- `CAPTCHA_SAVE_SUCCESS_IMAGES` (default `false`)
 - `DEFAULT_EXECUTOR_WORKERS` (default `8`)
 
 ## Railway Deployment
@@ -202,6 +208,8 @@ git push origin main
   - Keep flush at 5000, avoid very high write frequency, allow retries.
 - Too many captcha failures:
   - Lower search worker counts and check proxy quality.
+- Need CAPTCHA training images:
+  - Set `CAPTCHA_SAVE_SUCCESS_IMAGES=true`; keep it off for normal production runs.
 - Very verbose logs:
   - Keep `TESTING=false` in production.
 

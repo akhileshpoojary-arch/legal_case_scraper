@@ -691,7 +691,7 @@ class DailyRunSheetsManager:
             async def run_writes() -> int:
                 started = time.monotonic()
                 from daily_run.config import WRITE_BATCH_SIZE as CFG_BATCH_SIZE
-                effective_batch_size = max(CFG_BATCH_SIZE, 5000)
+                effective_batch_size = max(1, int(CFG_BATCH_SIZE))
 
                 active_id = await self.get_active_sheet(court_type)
                 await loop.run_in_executor(None, self._ensure_domain_editor_access, active_id)

@@ -13,6 +13,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except (TypeError, ValueError):
+        return default
+
+
 TESTING = _env_bool("TESTING", False)
 VERBOSE_CAPTCHA_LOGS = _env_bool("VERBOSE_CAPTCHA_LOGS", False)
 
@@ -80,14 +90,14 @@ SC_PROGRESS_FILE = str(
 
 _CURRENT_YEAR = datetime.today().year
 
-DC_START_YEAR = 1950
-DC_END_YEAR = _CURRENT_YEAR
+DC_START_YEAR = _env_int("DC_START_YEAR", 1950)
+DC_END_YEAR = _env_int("DC_END_YEAR", _CURRENT_YEAR)
 
-HC_START_YEAR = 1950
-HC_END_YEAR = _CURRENT_YEAR
+HC_START_YEAR = _env_int("HC_START_YEAR", 1950)
+HC_END_YEAR = _env_int("HC_END_YEAR", _CURRENT_YEAR)
 
-SC_START_YEAR = 1950
-SC_END_YEAR = _CURRENT_YEAR
+SC_START_YEAR = _env_int("SC_START_YEAR", 1950)
+SC_END_YEAR = _env_int("SC_END_YEAR", _CURRENT_YEAR)
 
 # ═══════════════════════════════════════════════════════════════
 #  BATCH SIZES — 5000 reduces Google Sheets API calls
@@ -103,7 +113,10 @@ DC_WRITE_BATCH_SIZE = int(os.environ.get("DC_WRITE_BATCH_SIZE", SHEET_FLUSH_CASE
 
 DC_MIN_WRITE_SIZE = int(os.environ.get("DC_MIN_WRITE_SIZE", SHEET_FLUSH_CASES))
 
-SC_MAX_CONSECUTIVE_FAILURES = 10000
+SC_MAX_CONSECUTIVE_FAILURES = _env_int(
+    "SC_EMPTY_STREAK_STOP",
+    _env_int("SC_MAX_CONSECUTIVE_FAILURES", 750),
+)
 HC_MAX_DETAIL_RETRIES = 20
 HC_TELEMETRY_EVERY = 100
 DC_TELEMETRY_EVERY = 100

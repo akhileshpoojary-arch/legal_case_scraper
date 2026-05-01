@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from utils.http_client import BaseHTTPClient, create_http_client
@@ -48,6 +49,7 @@ class SessionManager:
         self._proxy_rotator = proxy_rotator
         self._current_proxy: str | None = None
         self._last_failure_reason: str | None = None
+        self._last_proxy_success_report_at = 0.0
 
     async def _ensure_client(self) -> BaseHTTPClient:
         if self._client is None:
@@ -99,12 +101,16 @@ class SessionManager:
                 return False
 
     def _record_success(self) -> None:
+        had_failures = self._consecutive_failures > 0
         self._consecutive_failures = 0
         self._last_failure_reason = None
         if self._proxy_rotator and self._current_proxy:
-            asyncio.ensure_future(
-                self._proxy_rotator.report_success(self._current_proxy)
-            )
+            now = time.monotonic()
+            if had_failures or now - self._last_proxy_success_report_at >= 30.0:
+                self._last_proxy_success_report_at = now
+                asyncio.create_task(
+                    self._proxy_rotator.report_success(self._current_proxy)
+                )
 
     @staticmethod
     def _classify_exception(exc: Exception) -> str:

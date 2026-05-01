@@ -72,12 +72,33 @@ class CaptchaModelSolver:
             max(1, int(os.environ.get("CAPTCHA_MODEL_MAX_CONCURRENCY", "2")))
         )
 
+        def select_model_file(
+            bundle_dir: Path,
+            env_name: str,
+            preferred: str = "model.keras",
+        ) -> Path:
+            configured = os.environ.get(env_name, "").strip()
+            if configured:
+                candidate = bundle_dir / configured
+                if candidate.exists():
+                    return candidate
+                logger.warning(
+                    "%s=%s does not exist under %s; falling back to %s",
+                    env_name,
+                    configured,
+                    bundle_dir,
+                    preferred,
+                )
+            preferred_path = bundle_dir / preferred
+            if preferred_path.exists():
+                return preferred_path
+            return bundle_dir / "model.keras"
+
         # ── Type 1: CTC text recognition (DC/HC) ──
         t1_path = _BUNDLE_DIR / "type1"
-        logger.info("Loading Type 1 CTC model from %s ...", t1_path)
-        self._t1_model = keras.models.load_model(
-            str(t1_path / "model.keras"), compile=False
-        )
+        t1_model_file = select_model_file(t1_path, "CAPTCHA_TYPE1_MODEL_FILE")
+        logger.info("Loading Type 1 CTC model from %s ...", t1_model_file)
+        self._t1_model = keras.models.load_model(str(t1_model_file), compile=False)
         with open(t1_path / "vocab.json") as f:
             t1_cfg = json.load(f)
         self._t1_vocab: list[str] = t1_cfg["vocab"]
@@ -93,10 +114,13 @@ class CaptchaModelSolver:
 
         # ── Type 2: Classifier (SC math captchas) ──
         t2_path = _BUNDLE_DIR / "type2"
-        logger.info("Loading Type 2 classifier model from %s ...", t2_path)
-        self._t2_model = keras.models.load_model(
-            str(t2_path / "model.keras"), compile=False
+        t2_model_file = select_model_file(
+            t2_path,
+            "CAPTCHA_TYPE2_MODEL_FILE",
+            preferred="model_best.keras",
         )
+        logger.info("Loading Type 2 classifier model from %s ...", t2_model_file)
+        self._t2_model = keras.models.load_model(str(t2_model_file), compile=False)
         with open(t2_path / "vocab.json") as f:
             t2_cfg = json.load(f)
         self._t2_num_classes: int = t2_cfg["num_classes"]

@@ -25,6 +25,13 @@ _CAPTCHA_EXECUTOR = ThreadPoolExecutor(
 )
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def warm_up_reader() -> None:
     """Load Keras models into memory on startup (singleton, safe to call multiple times)."""
     from utils.captcha_model import get_solver
@@ -112,6 +119,9 @@ def save_captcha_image(image_bytes: bytes, response: str, prefix: str) -> None:
     Save CAPTCHA image to subfolder named after the response.
     sc uses timestamp to avoid overwrites.
     """
+    if not _env_bool("CAPTCHA_SAVE_SUCCESS_IMAGES", False):
+        return
+
     if not image_bytes or not response:
         return
 

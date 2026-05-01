@@ -16,13 +16,16 @@ from config import (
     PROXY_FILE,
     REQUEST_DELAY,
 )
-from daily_run.cluster import read_config_row_sync, slice_for_shard
+from daily_run.cluster import (
+    bounded_detail_pipeline,
+    read_config_row_sync,
+    slice_for_shard,
+)
 from daily_run.config import (
     CONFIG_WORKSHEET_NAME,
     DETAIL_SESSION_POOL_SIZE,
     HC_END_YEAR,
     HC_PROGRESS_FILE,
-    HC_SEARCH_WORKERS,
     HC_DETAIL_WORKERS,
     SHEET_FLUSH_CASES,
     HC_TELEMETRY_EVERY,
@@ -126,12 +129,11 @@ class HCContinuousScraper:
                 list(HIGH_COURTS), SYSTEM_SHARD_ID, total
             )
             logger.info(
-                "[HC] Worker slice: worker=%s total_systems=%d shard_id=%d courts=%d search_workers=%d detail_workers=%d",
+                "[HC] Worker slice: worker=%s total_systems=%d shard_id=%d courts=%d detail_workers=%d",
                 WORKER_LABEL,
                 total,
                 SYSTEM_SHARD_ID,
                 len(self._courts_slice),
-                max(1, int(HC_SEARCH_WORKERS)),
                 max(1, int(HC_DETAIL_WORKERS)),
             )
 
@@ -250,14 +252,9 @@ class HCContinuousScraper:
                 )
 
                 search_started = time.monotonic()
-                worker_count = max(1, int(HC_SEARCH_WORKERS))
                 detail_limit = max(1, int(HC_DETAIL_WORKERS))
                 telemetry_every = max(20, int(HC_TELEMETRY_EVERY))
                 write_batch_size = max(1, int(SHEET_FLUSH_CASES))
-
-                queue: asyncio.Queue[dict | None] = asyncio.Queue()
-                pending_detail_tasks: set[asyncio.Task[dict | None]] = set()
-                write_buffer: list[dict[str, Any]] = []
 
                 court_info = {
                     "name": state["name"],
@@ -282,11 +279,6 @@ class HCContinuousScraper:
                     await asyncio.sleep(3)
                     continue
 
-                async def enqueue_worker(worker_idx: int) -> None:
-                    for idx in range(worker_idx, len(cases), worker_count):
-                        await queue.put(cases[idx])
-                    await queue.put(None)
-
                 async def build_row(case_data: dict) -> dict | None:
                     cino = case_data.get("cino", "")
                     case_no = case_data.get("case_no", "")
@@ -300,133 +292,26 @@ class HCContinuousScraper:
                     normalize_row(row)
                     return row
 
-                async def flush_details(block: bool = False) -> tuple[int, int]:
-                    if not pending_detail_tasks:
-                        return 0, 0
-                    if block:
-                        done, _ = await asyncio.wait(
-                            pending_detail_tasks, return_when=asyncio.FIRST_COMPLETED
-                        )
-                    else:
-                        done = {t for t in pending_detail_tasks if t.done()}
-                        if not done:
-                            return 0, 0
+                async def write_rows(rows: list[dict[str, Any]]) -> int:
+                    return await self._sheets.write_cases("hc", rows)
 
-                    success = 0
-                    failure = 0
-                    for task in done:
-                        pending_detail_tasks.discard(task)
-                        try:
-                            row = task.result()
-                        except Exception:
-                            # logger.exception("[HC] Detail task failed.")
-                            failure += 1
-                            continue
-                        if row is None:
-                            failure += 1
-                            continue
-                        success += 1
-                        write_buffer.append(row)
-                    return success, failure
+                pipe_stats = await bounded_detail_pipeline(
+                    items=cases,
+                    build_row=build_row,
+                    write_rows=write_rows,
+                    detail_limit=detail_limit,
+                    write_batch_size=write_batch_size,
+                    telemetry_every=telemetry_every,
+                    logger=logger,
+                    log_prefix="HC",
+                    target_label=target_label,
+                    worker_label=WORKER_LABEL,
+                    session_written_base=self._session_written_total,
+                )
 
-                async def flush_write_buffer(force: bool = False) -> int:
-                    if not write_buffer:
-                        return 0
-                    if not force and len(write_buffer) < write_batch_size:
-                        return 0
-                    chunk = list(write_buffer[:write_batch_size] if not force else write_buffer)
-                    del write_buffer[: len(chunk)]
-                    await self._sheets.write_cases("hc", chunk)
-                    return len(chunk)
-
-                search_tasks = [
-                    asyncio.create_task(enqueue_worker(i)) for i in range(worker_count)
-                ]
-                await asyncio.gather(*search_tasks)
-
-                finished_workers = 0
-                enqueued = 0
-                detail_success_total = 0
-                detail_failure_total = 0
-                written_total = 0
-
-                # Tracker for task start times
-                task_start_times: dict[asyncio.Task, float] = {}
-
-                async def monitor_stale_tasks():
-                    now = time.monotonic()
-                    for task, start_time in list(task_start_times.items()):
-                        if not task.done() and (now - start_time) > 600: # 10 minutes
-                            logger.warning("[HC] Cancelling stale detail task (elapsed %.1fs)", now - start_time)
-                            task.cancel()
-                            task_start_times.pop(task, None)
-                        elif task.done():
-                            task_start_times.pop(task, None)
-
-                while finished_workers < worker_count:
-                    await monitor_stale_tasks()
-                    # Non-blocking check for any finished tasks
-                    s, f = await flush_details(block=False)
-                    detail_success_total += s
-                    detail_failure_total += f
-                    written_total += await flush_write_buffer()
-
-                    # Block until an item is available from the search workers (or they all finish)
-                    # We use a timeout to ensure we periodically check for finished tasks and stale tasks
-                    try:
-                        item = await asyncio.wait_for(queue.get(), timeout=10.0)
-                    except asyncio.TimeoutError:
-                        continue
-
-                    if item is None:
-                        finished_workers += 1
-                        continue
-
-                    # Start detail task
-                    task = asyncio.create_task(build_row(item))
-                    pending_detail_tasks.add(task)
-                    task_start_times[task] = time.monotonic()
-                    enqueued += 1
-
-                    # Telemetry (check every N enqueues during the fill phase)
-                    if enqueued % telemetry_every == 0:
-                        detail_done = detail_success_total + detail_failure_total
-                        logger.info(
-                            "[HC] Pipeline telemetry: worker=%s target={%s} search_total=%d detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d detail_left=%d in_flight=%d write_buffer=%d/%d stage_written=%d session_written=%d",
-                            WORKER_LABEL,
-                            target_label,
-                            count,
-                            enqueued,
-                            detail_done,
-                            detail_success_total,
-                            detail_failure_total,
-                            max(count - detail_done, 0),
-                            len(pending_detail_tasks),
-                            len(write_buffer),
-                            write_batch_size,
-                            written_total,
-                            self._session_written_total + written_total,
-                        )
-
-                    # If at concurrency limit, block until at least one task finishes
-                    while len(pending_detail_tasks) >= detail_limit:
-                        await monitor_stale_tasks()
-                        s, f = await flush_details(block=True)
-                        detail_success_total += s
-                        detail_failure_total += f
-                        written_total += await flush_write_buffer()
-
-                # Final drain phase: Wait for all remaining detail tasks to finish
-                if pending_detail_tasks:
-                    logger.info("[HC] Draining %d remaining detail tasks...", len(pending_detail_tasks))
-                    while pending_detail_tasks:
-                        await monitor_stale_tasks()
-                        s, f = await flush_details(block=True)
-                        detail_success_total += s
-                        detail_failure_total += f
-                        written_total += await flush_write_buffer()
-
-                written_total += await flush_write_buffer(force=True)
+                detail_success_total = pipe_stats.detail_success
+                detail_failure_total = pipe_stats.detail_failure
+                written_total = pipe_stats.written
                 search_elapsed = time.monotonic() - search_started
                 self._session_stage_total += 1
                 self._session_detail_total += detail_success_total

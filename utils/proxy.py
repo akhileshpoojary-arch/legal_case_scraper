@@ -10,8 +10,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 logger = logging.getLogger("legal_scraper.proxy")
 
@@ -42,16 +43,32 @@ class ProxyRotator:
     @staticmethod
     def _load(path: Path) -> list[_ProxyEntry]:
         entries: list[_ProxyEntry] = []
+        if not path.exists():
+            logger.info("Proxy file %s not found; running without proxies.", path)
+            return entries
+
         raw = path.read_text(encoding="utf-8", errors="ignore")
         for line in raw.splitlines():
             line = line.strip().replace("\r", "")
-            if not line:
+            if not line or line.startswith("#"):
                 continue
-            parts = line.split(":")
-            if len(parts) < 4:
+
+            url = ""
+            if "://" in line:
+                parsed = urlparse(line)
+                if parsed.scheme and parsed.hostname and parsed.port:
+                    url = line
+            else:
+                parts = line.split(":")
+                if len(parts) >= 4:
+                    ip, port, user, passwd = parts[0], parts[1], parts[2], parts[3]
+                    url = f"http://{user}:{passwd}@{ip}:{port}"
+                elif len(parts) == 2:
+                    host, port = parts
+                    url = f"http://{host}:{port}"
+
+            if not url:
                 continue
-            ip, port, user, passwd = parts[0], parts[1], parts[2], parts[3]
-            url = f"http://{user}:{passwd}@{ip}:{port}"
             entries.append(_ProxyEntry(url=url))
         return entries
 

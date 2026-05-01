@@ -284,7 +284,7 @@ class AiohttpClient(BaseHTTPClient):
                 return await resp.read()
         except Exception as exc:
             logger.debug("aiohttp GET_BYTES %s failed: %s", url, exc)
-            return None
+            raise
 
     async def close(self) -> None:
         if self._session:

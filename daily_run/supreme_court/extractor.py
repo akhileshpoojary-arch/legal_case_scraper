@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import re
 from typing import Any
@@ -20,7 +21,7 @@ MAX_CAPTCHA_RETRIES = 15
 IMG_TIMEOUT = 10.0
 DETAIL_TIMEOUT = 30
 
-SCI_TABS = [
+SCI_ALL_TABS = [
     "case_details",
     "listing_dates",
     "interlocutory_application_documents",
@@ -31,6 +32,27 @@ SCI_TABS = [
     "earlier_court_details",
     "similarities",
 ]
+SCI_REQUIRED_TABS = [
+    "case_details",
+    "listing_dates",
+    "interlocutory_application_documents",
+    "judgement_orders",
+]
+# Backward-compatible export for callers that imported the old constant.
+SCI_TABS = SCI_ALL_TABS
+
+
+def _configured_sc_detail_tabs() -> list[str]:
+    raw = os.environ.get("SC_DETAIL_TABS", "required").strip().lower()
+    if raw in {"", "required", "minimal"}:
+        return list(SCI_REQUIRED_TABS)
+    if raw == "all":
+        return list(SCI_ALL_TABS)
+
+    allowed = set(SCI_ALL_TABS)
+    requested = [part.strip() for part in raw.split(",") if part.strip()]
+    selected = [tab for tab in requested if tab in allowed]
+    return selected or list(SCI_REQUIRED_TABS)
 
 # All case types from SCI website — value is the numeric code used in the API
 SCI_CASE_TYPES = [
@@ -87,6 +109,7 @@ class SCIContinuousExtractor:
         self._sm = session_manager
         self._detail_sessions = detail_sessions or [session_manager]
         self._detail_rr = 0
+        self._detail_tabs = _configured_sc_detail_tabs()
         self._search_metrics: dict[str, int] = {
             "attempts": 0,
             "captcha_solved": 0,
@@ -426,7 +449,7 @@ class SCIContinuousExtractor:
                 return tab_name, ""
             return tab_name, str(resp.get("data", ""))
 
-        tasks = [fetch_tab(tab) for tab in SCI_TABS]
+        tasks = [fetch_tab(tab) for tab in self._detail_tabs]
         results = await asyncio.gather(*tasks)
 
         tab_data: dict[str, str] = {}
