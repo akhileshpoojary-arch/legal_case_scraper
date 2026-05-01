@@ -84,7 +84,7 @@ class SCIExtractor(BaseExtractor):
     ) -> tuple[list[dict], int]:
         """Search cases for a single year using the initialized token."""
         from utils.captcha import solve as captcha_solve
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
             # 1. Download Captcha

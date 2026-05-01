@@ -167,13 +167,16 @@ python3 run_sc.py
 ### Logging / mode
 
 - `TESTING` (`true`/`false`, default `false`)
+- `VERBOSE_CAPTCHA_LOGS` (`false` by default; keep false in production to log summaries instead of every CAPTCHA attempt)
 
 ### TensorFlow safety (optional override)
 
 - `TF_NUM_INTRAOP_THREADS` (default `1`)
 - `TF_NUM_INTEROP_THREADS` (default `1`)
 - `CAPTCHA_MODEL_MAX_CONCURRENCY` (default `2`)
-- `CAPTCHA_EXECUTOR_WORKERS` (default `2`)
+- `CAPTCHA_EXECUTOR_WORKERS` (default `4`)
+- `CAPTCHA_SOLVER_MODE` (`ensemble`, `keras_only`, or `ddddocr_only`; default `ensemble`)
+- `CAPTCHA_PREPROCESS` (`true` by default)
 - `CAPTCHA_TYPE1_MODEL_FILE` (default `model.keras`)
 - `CAPTCHA_TYPE2_MODEL_FILE` (default `model_best.keras` when present)
 - `CAPTCHA_SAVE_SUCCESS_IMAGES` (default `false`)
@@ -207,11 +210,11 @@ git push origin main
 - Google Sheets 429:
   - Keep flush at 5000, avoid very high write frequency, allow retries.
 - Too many captcha failures:
-  - Lower search worker counts and check proxy quality.
+  - Check summary `accept_rate`, lower search worker counts, and check proxy quality.
 - Need CAPTCHA training images:
   - Set `CAPTCHA_SAVE_SUCCESS_IMAGES=true`; keep it off for normal production runs.
 - Very verbose logs:
-  - Keep `TESTING=false` in production.
+  - Keep `TESTING=false` and `VERBOSE_CAPTCHA_LOGS=false` in production.
 
 ## Notes
 

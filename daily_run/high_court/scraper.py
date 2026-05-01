@@ -38,6 +38,7 @@ from daily_run.high_court.parser import build_hc_row, parse_detail_html
 from daily_run.sheets_manager import DailyRunSheetsManager
 from utils.logging_utils import (
     descending_year_progress,
+    format_percent,
     hc_target_label,
     stage_progress,
 )
@@ -115,9 +116,6 @@ class HCContinuousScraper:
             json.dump(prog, f, indent=4)
 
     async def run(self) -> None:
-        from utils.captcha import warm_up_reader
-
-        warm_up_reader()
         logger.info("Starting HC Continuous 24/7 Scraper...")
 
         def refresh_court_slice() -> None:
@@ -317,18 +315,35 @@ class HCContinuousScraper:
                 self._session_detail_total += detail_success_total
                 self._session_written_total += written_total
                 logger.info(
-                    "[HC] Stage summary: worker=%s target={%s} total=%.2fs search_total=%d detail_ok=%d detail_fail=%d written=%d session_written=%d session_detail_ok=%d stages_done=%d",
+                    "[HC] Stage summary: worker=%s target={%s} total=%.2fs search_total=%d detail_ok=%d detail_fail=%d detail_success=%s duplicate_skips=%d written=%d session_written=%d session_detail_ok=%d stages_done=%d",
                     WORKER_LABEL,
                     target_label,
                     search_elapsed,
                     count,
                     detail_success_total,
                     detail_failure_total,
+                    format_percent(
+                        detail_success_total,
+                        max(detail_success_total + detail_failure_total, 1),
+                    ),
+                    pipe_stats.duplicates_skipped,
                     written_total,
                     self._session_written_total,
                     self._session_detail_total,
                     self._session_stage_total,
                 )
+
+                # Log ensemble solver accuracy periodically
+                if self._session_stage_total % 10 == 0:
+                    try:
+                        from utils.captcha_ensemble import get_ensemble_solver
+                        solver = get_ensemble_solver()
+                        logger.info(
+                            "[HC] Ensemble accuracy: %s",
+                            solver.accuracy_summary(),
+                        )
+                    except Exception:
+                        pass
 
                 prog["status_idx"] += 1
                 self._save_progress(prog)

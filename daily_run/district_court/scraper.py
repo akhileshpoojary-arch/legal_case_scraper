@@ -39,6 +39,7 @@ from daily_run.sheets_manager import DailyRunSheetsManager
 from utils.logging_utils import (
     dc_target_label,
     descending_year_progress,
+    format_percent,
     stage_progress,
 )
 from utils.normalize import normalize_row
@@ -123,9 +124,6 @@ class DCContinuousScraper:
             json.dump(prog, f, indent=4)
 
     async def run(self) -> None:
-        from utils.captcha import warm_up_reader
-
-        warm_up_reader()
         logger.info("Starting DC Continuous 24/7 Scraper...")
 
         def refresh_state_slice() -> None:
@@ -392,13 +390,17 @@ class DCContinuousScraper:
                 self._session_detail_total += detail_success_total
                 self._session_written_total += written_total
                 logger.info(
-                    "[DC] Stage summary: worker=%s target={%s} total=%.2fs search_total=%d detail_ok=%d detail_fail=%d duplicate_skips=%d written=%d session_written=%d session_detail_ok=%d stages_done=%d",
+                    "[DC] Stage summary: worker=%s target={%s} total=%.2fs search_total=%d detail_ok=%d detail_fail=%d detail_success=%s duplicate_skips=%d written=%d session_written=%d session_detail_ok=%d stages_done=%d",
                     WORKER_LABEL,
                     target_label,
                     search_elapsed,
                     count,
                     detail_success_total,
                     detail_failure_total,
+                    format_percent(
+                        detail_success_total,
+                        max(detail_success_total + detail_failure_total, 1),
+                    ),
                     pipe_stats.duplicates_skipped,
                     written_total,
                     self._session_written_total,

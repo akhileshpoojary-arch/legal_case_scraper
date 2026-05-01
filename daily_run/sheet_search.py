@@ -47,7 +47,7 @@ class BaseSheetSearchScraper(BaseScraper):
         if not col:
             return []
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         entity_type = getattr(config, "ENTITY_TYPE", "individual")
 
         augmented_patterns: list[re.Pattern[str]] | None = None

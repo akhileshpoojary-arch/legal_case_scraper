@@ -12,7 +12,7 @@ from urllib.parse import quote
 from bs4 import BeautifulSoup
 
 from config import COMMON_HEADERS
-from daily_run.config import TESTING
+from daily_run.config import TESTING, VERBOSE_CAPTCHA_LOGS
 from utils.session_utils import SessionManager
 
 logger = logging.getLogger("legal_scraper.daily_run.dc.extractor")
@@ -277,7 +277,11 @@ class DCContinuousExtractor:
         case_status: str,
         search_label: str | None = None,
     ) -> Tuple[list[dict], int, str]:
-        from utils.captcha import solve_async as captcha_solve_async
+        from utils.captcha import (
+            record_captcha_feedback,
+            save_captcha_image,
+            solve_async_with_metadata as captcha_solve_async,
+        )
 
         cplx_base = complex_code.split("@")[0] if "@" in complex_code else complex_code
         target_label = (
@@ -312,6 +316,7 @@ class DCContinuousExtractor:
             "captcha_rejected": 0,
             "transport_failures": 0,
             "parse_failures": 0,
+            "captcha_accepted": 0,
             "retry_exhausted": 0,
             "consecutive_fail_cutoff": 0,
         }
@@ -325,8 +330,9 @@ class DCContinuousExtractor:
             total: int | None = None,
             will_retry: bool = False,
         ) -> None:
+            log = logger.info if VERBOSE_CAPTCHA_LOGS else logger.debug
             if outcome == "success":
-                logger.info(
+                log(
                     "[DC] CAPTCHA success: target={%s} attempt=%d/%d prediction=%s site_result=%s total=%d",
                     target_label,
                     attempt_no,
@@ -337,7 +343,7 @@ class DCContinuousExtractor:
                 )
                 return
 
-            logger.info(
+            log(
                 "[DC] CAPTCHA fail: target={%s} attempt=%d/%d prediction=%s site_result=%s retry=%s",
                 target_label,
                 attempt_no,
@@ -348,24 +354,31 @@ class DCContinuousExtractor:
             )
 
         def log_summary(state: str, total: int = 0) -> None:
+            solved = max(0, int(stats["captcha_solved"]))
+            accepted = max(0, int(stats["captcha_accepted"]))
+            rejected = max(0, int(stats["captcha_rejected"]))
+            accept_rate = (accepted / solved * 100.0) if solved else 0.0
             logger.info(
-                "[DC] Search summary: target={%s} result=%s total=%d attempts=%d solved=%d rejected=%d empty=%d no_image=%d transport=%d parse=%d",
+                "[DC] Search summary: target={%s} result=%s cases_found=%d captcha_attempts=%d solved=%d accepted=%d rejected=%d accept_rate=%.1f%% empty=%d no_image=%d transport=%d parse=%d cutoff=%d",
                 target_label,
                 state,
                 total,
                 stats["attempts"],
-                stats["captcha_solved"],
-                stats["captcha_rejected"],
+                solved,
+                accepted,
+                rejected,
+                accept_rate,
                 stats["captcha_empty"],
                 stats["captcha_image_missing"],
                 stats["transport_failures"],
                 stats["parse_failures"],
+                stats["consecutive_fail_cutoff"],
             )
 
         for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
             stats["attempts"] += 1
             if attempt > 1:
-                await asyncio.sleep(min(2 * (1 + random.random()), 6))
+                await asyncio.sleep(0.3 + random.random() * 0.5)
 
             img_bytes = await self._download_captcha_bytes()
             if not img_bytes:
@@ -387,7 +400,7 @@ class DCContinuousExtractor:
                     return [], 0, "retryable_error"
                 continue
 
-            captcha = await captcha_solve_async(img_bytes, 6, "dc")
+            captcha, solver_name = await captcha_solve_async(img_bytes, 6, "dc")
 
             if not captcha:
                 stats["captcha_empty"] += 1
@@ -470,6 +483,7 @@ class DCContinuousExtractor:
                 or '<div class="alert alert-danger' in text
             ):
                 stats["captcha_rejected"] += 1
+                record_captcha_feedback("dc", False, solver_name)
                 consec_fail += 1
                 log_captcha_attempt(
                     attempt,
@@ -490,6 +504,9 @@ class DCContinuousExtractor:
             # DC endpoint can return either `case_data` or `party_data`.
             party_data = data.get("case_data") or data.get("party_data", "")
             if "Total number of cases : 0" in party_data or not party_data:
+                stats["captcha_accepted"] += 1
+                consec_fail = 0
+                record_captcha_feedback("dc", True, solver_name)
                 log_captcha_attempt(
                     attempt,
                     captcha,
@@ -500,9 +517,10 @@ class DCContinuousExtractor:
                 log_summary("no_results", 0)
                 return [], 0, "no_results"
 
-            from utils.captcha import save_captcha_image
-
             save_captcha_image(img_bytes, captcha, "dc")
+            stats["captcha_accepted"] += 1
+            consec_fail = 0
+            record_captcha_feedback("dc", True, solver_name)
 
             soup = BeautifulSoup(party_data, "html.parser")
             case_links = soup.find_all("a", href="#")

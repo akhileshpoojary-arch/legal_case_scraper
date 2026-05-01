@@ -32,6 +32,7 @@ from daily_run.supreme_court.parser import build_sc_row
 from daily_run.sheets_manager import DailyRunSheetsManager
 from utils.logging_utils import (
     descending_year_progress,
+    format_percent,
     sc_target_label,
     stage_progress,
 )
@@ -146,9 +147,6 @@ class SCContinuousScraper:
             json.dump(prog, f, indent=4)
 
     async def run(self) -> None:
-        from utils.captcha import warm_up_reader
-
-        warm_up_reader()
         logger.info("Starting SC Continuous 24/7 Scraper (Case Type + Case No)...")
 
         def refresh_case_type_slice() -> None:
@@ -332,6 +330,7 @@ class SCContinuousScraper:
                             else None
                         )
                         if search_state in {"captcha_error", "retryable_error"}:
+                            extractor.invalidate_tokens()
                             scid = tok_name = tok_value = None
                             await asyncio.sleep(0.25)
                             continue
@@ -392,6 +391,8 @@ class SCContinuousScraper:
                     if search_tick % telemetry_every == 0:
                         metric_totals = {
                             "attempts": 0,
+                            "captcha_accepted": 0,
+                            "captcha_rejected": 0,
                             "search_hits": 0,
                             "no_records": 0,
                             "retryable_errors": 0,
@@ -401,27 +402,44 @@ class SCContinuousScraper:
                             for key in metric_totals:
                                 metric_totals[key] += int(metrics.get(key, 0))
                         detail_done = detail_success_total + detail_failure_total
+                        captcha_accept_rate = format_percent(
+                            metric_totals["captcha_accepted"],
+                            max(metric_totals["captcha_accepted"] + metric_totals["captcha_rejected"], 1),
+                        )
                         logger.info(
-                            "[SC] Pipeline telemetry: worker=%s target={%s} case_no_start=%d searched_upto=%d hits=%d detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d detail_left=%d in_flight=%d buffer=%d/%d stage_written=%d session_written=%d attempts=%d no_records=%d retryable=%d",
+                            "[SC] Pipeline telemetry: worker=%s target={%s} case_no_start=%d searched_upto=%d hits=%d hit_rate=%s detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d detail_left=%d detail_pct=%s in_flight=%d buffer=%d/%d buffer_pct=%s stage_written=%d session_written=%d captcha_attempts=%d captcha_accept_rate=%s no_records=%d retryable=%d",
                             WORKER_LABEL,
                             target_label,
                             case_no_start,
                             max_searched_case_no,
                             consumed_results,
+                            format_percent(consumed_results, max(metric_totals["attempts"], 1)),
                             consumed_results,
                             detail_done,
                             detail_success_total,
                             detail_failure_total,
                             max(consumed_results - detail_done, 0),
+                            format_percent(detail_done, max(consumed_results, 1)),
                             len(pending_detail_tasks),
                             len(batch_results),
                             max(1, int(SHEET_FLUSH_CASES)),
+                            format_percent(len(batch_results), max(1, int(SHEET_FLUSH_CASES))),
                             written_total,
                             self._session_written_total + written_total,
                             metric_totals["attempts"],
+                            captcha_accept_rate,
                             metric_totals["no_records"],
                             metric_totals["retryable_errors"],
                         )
+                        # Log ensemble accuracy if available
+                        try:
+                            from utils.captcha_ensemble import get_ensemble_solver
+                            logger.info(
+                                "[SC] Ensemble accuracy: %s",
+                                get_ensemble_solver().accuracy_summary(),
+                            )
+                        except Exception:
+                            pass
 
                 for task in worker_tasks:
                     await task
@@ -444,6 +462,7 @@ class SCContinuousScraper:
                 captcha_totals = {
                     "attempts": 0,
                     "captcha_solved": 0,
+                    "captcha_accepted": 0,
                     "captcha_rejected": 0,
                     "captcha_empty": 0,
                     "captcha_image_missing": 0,
@@ -462,30 +481,40 @@ class SCContinuousScraper:
                 self._session_stage_total += 1
                 self._session_detail_total += detail_success_total
                 self._session_written_total += written_total
+                captcha_accept_rate = format_percent(
+                    captcha_totals["captcha_accepted"],
+                    max(captcha_totals["captcha_accepted"] + captcha_totals["captcha_rejected"], 1),
+                )
                 logger.info(
-                    "[SC] Captcha summary: worker=%s target={%s} attempts=%d solved=%d rejected=%d empty=%d no_image=%d exhausted=%d retryable=%d",
+                    "[SC] Captcha summary: worker=%s target={%s} attempts=%d solved=%d accepted=%d rejected=%d accept_rate=%s empty=%d no_image=%d exhausted=%d retryable=%d",
                     WORKER_LABEL,
                     target_label,
                     captcha_totals["attempts"],
                     captcha_totals["captcha_solved"],
+                    captcha_totals["captcha_accepted"],
                     captcha_totals["captcha_rejected"],
+                    captcha_accept_rate,
                     captcha_totals["captcha_empty"],
                     captcha_totals["captcha_image_missing"],
                     captcha_totals["captcha_exhausted"],
                     captcha_totals["retryable_errors"],
                 )
                 logger.info(
-                    "[SC] Stage summary: worker=%s target={%s} case_no_start=%d searched_upto=%d duration=%.2fs search_hits=%d detail_ok=%d detail_fail=%d written=%d no_records=%d session_written=%d session_detail_ok=%d stages_done=%d",
+                    "[SC] Stage summary: worker=%s target={%s} case_no_start=%d searched_upto=%d duration=%.2fs search_hits=%d no_records=%d detail_ok=%d detail_fail=%d detail_success=%s written=%d session_written=%d session_detail_ok=%d stages_done=%d",
                     WORKER_LABEL,
                     target_label,
                     case_no_start,
                     max_searched_case_no,
                     search_elapsed,
                     consumed_results,
+                    captcha_totals["no_records"],
                     detail_success_total,
                     detail_failure_total,
+                    format_percent(
+                        detail_success_total,
+                        max(detail_success_total + detail_failure_total, 1),
+                    ),
                     written_total,
-                    captcha_totals["no_records"],
                     self._session_written_total,
                     self._session_detail_total,
                     self._session_stage_total,

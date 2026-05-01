@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from utils.logging_utils import format_percent
+
 logger = logging.getLogger("legal_scraper.daily_run.cluster")
 
 # Legacy layout: values only in row 1 (A1=total, B1/C1/D1=locks)
@@ -203,7 +205,7 @@ async def acquire_write_lock(
 ) -> None:
     if not worksheet_name:
         return
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     attempt = 0
     while True:
         ok = await loop.run_in_executor(
@@ -231,7 +233,7 @@ async def release_write_lock(
 ) -> None:
     if not worksheet_name:
         return
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None,
         lambda: release_write_lock_sync(
@@ -364,10 +366,12 @@ async def bounded_detail_pipeline(
                 stats.search_total - detail_done - stats.duplicates_skipped,
                 0,
             )
+            success_rate = format_percent(stats.detail_success, max(detail_done, 1))
             logger.info(
                 "[%s] Pipeline telemetry: worker=%s target={%s} search_total=%d "
                 "detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d "
-                "detail_left=%d in_flight=%d write_buffer=%d/%d stage_written=%d "
+                "detail_left=%d detail_pct=%s detail_success=%s in_flight=%d "
+                "write_buffer=%d/%d buffer_pct=%s stage_written=%d "
                 "session_written=%d duplicate_skips=%d",
                 log_prefix,
                 worker_label,
@@ -378,9 +382,12 @@ async def bounded_detail_pipeline(
                 stats.detail_success,
                 stats.detail_failure,
                 detail_left,
+                format_percent(detail_done, max(stats.search_total, 1)),
+                success_rate,
                 len(pending),
                 len(write_buffer),
                 write_batch_size,
+                format_percent(len(write_buffer), write_batch_size),
                 stats.written,
                 session_written_base + stats.written,
                 stats.duplicates_skipped,

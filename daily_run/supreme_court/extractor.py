@@ -10,6 +10,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
+from daily_run.config import VERBOSE_CAPTCHA_LOGS
 from utils.session_utils import SessionManager
 
 logger = logging.getLogger("legal_scraper.daily_run.sc.extractor")
@@ -101,6 +102,9 @@ class SCIContinuousExtractor:
 
     SOURCE = "SUPREME_COURT"
 
+    # Reuse tokens across searches; refresh after this many uses
+    TOKEN_TTL_USES = 50
+
     def __init__(
         self,
         session_manager: SessionManager,
@@ -110,9 +114,13 @@ class SCIContinuousExtractor:
         self._detail_sessions = detail_sessions or [session_manager]
         self._detail_rr = 0
         self._detail_tabs = _configured_sc_detail_tabs()
+        # Token cache to avoid re-fetching on every search
+        self._cached_tokens: tuple[str | None, str | None, str | None] = (None, None, None)
+        self._token_uses = 0
         self._search_metrics: dict[str, int] = {
             "attempts": 0,
             "captcha_solved": 0,
+            "captcha_accepted": 0,
             "captcha_rejected": 0,
             "captcha_empty": 0,
             "captcha_image_missing": 0,
@@ -145,7 +153,14 @@ class SCIContinuousExtractor:
     def case_types(self) -> list[dict[str, str]]:
         return SCI_CASE_TYPES
 
-    async def get_base_tokens(self) -> tuple[str | None, str | None, str | None]:
+    async def get_base_tokens(self, force: bool = False) -> tuple[str | None, str | None, str | None]:
+        """Fetch security tokens, using cache unless expired or forced."""
+        if not force and self._token_uses < self.TOKEN_TTL_USES:
+            scid, tok_n, tok_v = self._cached_tokens
+            if scid and tok_n and tok_v:
+                self._token_uses += 1
+                return self._cached_tokens
+
         text = await self._sm.get_text(SCI_HOME, label="SCI Case No Page")
         if not text:
             return None, None, None
@@ -161,7 +176,13 @@ class SCIContinuousExtractor:
         scid = scid_input.get("value")
         tok_name = tok_input.get("name")
         tok_value = tok_input.get("value")
+        self._cached_tokens = (scid, tok_name, tok_value)
+        self._token_uses = 0
         return scid, tok_name, tok_value
+
+    def invalidate_tokens(self) -> None:
+        """Force token refresh on next get_base_tokens call."""
+        self._token_uses = self.TOKEN_TTL_USES + 1
 
     async def _download_captcha_bytes(self, scid: str) -> bytes | None:
         url = f"{SCI_BASE}/?_siwp_captcha&id={scid}&rand={random.random()}"
@@ -189,7 +210,11 @@ class SCIContinuousExtractor:
         If the model's prediction is wrong, fetches a new captcha and retries.
         Returns the parsed response dict or None if no record.
         """
-        from utils.captcha import solve_async as captcha_solve_async
+        from utils.captcha import (
+            record_captcha_feedback,
+            save_captcha_image,
+            solve_async_with_metadata as captcha_solve_async,
+        )
 
         target_label = search_label or f"case_type={case_type} year={year}"
 
@@ -201,8 +226,9 @@ class SCIContinuousExtractor:
             *,
             will_retry: bool = False,
         ) -> None:
+            log = logger.info if VERBOSE_CAPTCHA_LOGS else logger.debug
             if outcome == "success":
-                logger.info(
+                log(
                     "[SC] CAPTCHA success: target={%s} case_no=%d attempt=%d/%d prediction=%s site_result=%s",
                     target_label,
                     case_no,
@@ -213,7 +239,7 @@ class SCIContinuousExtractor:
                 )
                 return
 
-            logger.info(
+            log(
                 "[SC] CAPTCHA fail: target={%s} case_no=%d attempt=%d/%d prediction=%s site_result=%s retry=%s",
                 target_label,
                 case_no,
@@ -240,7 +266,7 @@ class SCIContinuousExtractor:
                 continue
 
             # Type 2 model directly predicts the numeric answer
-            captcha_val = await captcha_solve_async(img_bytes, 6, "sci")
+            captcha_val, solver_name = await captcha_solve_async(img_bytes, 6, "sci")
 
             if not captcha_val:
                 self._metric_inc("captcha_empty")
@@ -302,6 +328,7 @@ class SCIContinuousExtractor:
 
                 if is_captcha_err:
                     self._metric_inc("captcha_rejected")
+                    record_captcha_feedback("sci", False, solver_name)
                     log_captcha_attempt(
                         attempt,
                         captcha_val,
@@ -327,6 +354,8 @@ class SCIContinuousExtractor:
 
                 if isinstance(data, str) and "no records" in data.lower():
                     self._metric_inc("no_records")
+                    self._metric_inc("captcha_accepted")
+                    record_captcha_feedback("sci", True, solver_name)
                     log_captcha_attempt(
                         attempt,
                         captcha_val,
@@ -346,9 +375,9 @@ class SCIContinuousExtractor:
                 )
                 return {"_search_state": "retryable_error"}
 
-            from utils.captcha import save_captcha_image
-
             save_captcha_image(img_bytes, captcha_val, "sci")
+            self._metric_inc("captcha_accepted")
+            record_captcha_feedback("sci", True, solver_name)
 
             results_html = ""
             if isinstance(data, dict):

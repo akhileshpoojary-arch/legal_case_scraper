@@ -4,12 +4,15 @@ Session management with automatic cookie/session rotation on failures.
 Tracks consecutive failures and creates a fresh session + rotates cookies
 when MAX_FAILURES_BEFORE_ROTATE is exceeded. Optionally routes traffic
 through a ProxyRotator for IP diversity.
+
+Includes User-Agent refresh when a session is rotated.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from typing import Any
 
@@ -17,6 +20,18 @@ from utils.http_client import BaseHTTPClient, create_http_client
 from utils.proxy import ProxyRotator
 
 logger = logging.getLogger("legal_scraper.session")
+
+# Browser User-Agent pool used when a failed session is refreshed.
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0",
+]
 
 
 class SessionManager:
@@ -61,7 +76,7 @@ class SessionManager:
         return self._client
 
     async def _rotate_session(self) -> None:
-        """Close current session and create a fresh one with a new proxy."""
+        """Close current session and create a fresh one with a new proxy + UA."""
         self._rotation_count += 1
         if self._proxy_rotator and self._current_proxy:
             await self._proxy_rotator.report_failure(self._current_proxy)
@@ -74,6 +89,8 @@ class SessionManager:
             await self._client.close()
             self._client = None
         self._consecutive_failures = 0
+        # Rotate User-Agent on session refresh
+        self._headers["User-Agent"] = random.choice(_USER_AGENTS)
         # Pick a fresh proxy for the next session
         if self._proxy_rotator:
             self._current_proxy = await self._proxy_rotator.get_proxy()
@@ -137,6 +154,10 @@ class SessionManager:
         self._consecutive_failures += 1
         if self._consecutive_failures >= self._max_failures:
             await self._rotate_session()
+        else:
+            # Adaptive backoff: 0.5s → 1s → 2s → 4s (capped)
+            delay = min(0.5 * (2 ** (self._consecutive_failures - 1)), 4.0)
+            await asyncio.sleep(delay)
 
     async def post(
         self,

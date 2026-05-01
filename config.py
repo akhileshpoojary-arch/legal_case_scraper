@@ -102,7 +102,7 @@ def _resolve_proxy_file() -> Path:
     return Path(__file__).resolve().parent / "Webshare proxies.txt"
 
 PROXY_FILE = _resolve_proxy_file()
-PROXY_BAN_DURATION = 600
+PROXY_BAN_DURATION = 300
 MAX_PROXY_FAILURES = 10
 
 # ═══════════════════════════════════════════════════════════════

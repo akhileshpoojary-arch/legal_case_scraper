@@ -268,7 +268,7 @@ class DCExtractor(BaseExtractor):
                     return [], 0
                 continue
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             captcha = await loop.run_in_executor(None, captcha_solve, img_bytes, 6, "dc")
 
             if not captcha:

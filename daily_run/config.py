@@ -62,7 +62,7 @@ DETAIL_SESSION_POOL_SIZE = int(
     os.environ.get("DETAIL_SESSION_POOL_SIZE", max(4, min(12, _CPU_COUNT * 3)))
 )
 SC_SEARCH_WORKERS = int(
-    os.environ.get("SC_SEARCH_WORKERS", max(3, min(8, _CPU_COUNT * 2)))
+    os.environ.get("SC_SEARCH_WORKERS", max(3, min(12, _CPU_COUNT * 3)))
 )
 HC_SEARCH_WORKERS = int(
     os.environ.get("HC_SEARCH_WORKERS", max(2, min(6, _CPU_COUNT * 2)))
@@ -120,3 +120,10 @@ SC_MAX_CONSECUTIVE_FAILURES = _env_int(
 HC_MAX_DETAIL_RETRIES = 20
 HC_TELEMETRY_EVERY = 100
 DC_TELEMETRY_EVERY = 100
+
+# ═══════════════════════════════════════════════════════════════
+#  CAPTCHA SOLVER — ensemble mode with ddddocr fallback
+# ═══════════════════════════════════════════════════════════════
+# CAPTCHA_SOLVER_MODE: "ensemble" (both), "keras_only", "ddddocr_only"
+# CAPTCHA_PREPROCESS: "true" to apply OpenCV preprocessing before solving
+# These are read directly by utils/captcha_ensemble.py via os.environ

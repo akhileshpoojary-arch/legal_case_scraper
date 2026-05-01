@@ -274,7 +274,7 @@ class HCExtractor(BaseExtractor):
                 continue
 
             # ── Solve captcha in thread (CPU-bound OCR) ───────────────────────
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             captcha = await loop.run_in_executor(None, captcha_solve, img_bytes)
 
             if not captcha:

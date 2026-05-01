@@ -114,7 +114,12 @@ class AiohttpClient(BaseHTTPClient):
         if self._session is None:
             import aiohttp
 
-            connector = aiohttp.TCPConnector(limit=30, ssl=False)
+            connector = aiohttp.TCPConnector(
+                limit=100,
+                limit_per_host=20,
+                ssl=False,
+                enable_cleanup_closed=True,
+            )
             self._session = aiohttp.ClientSession(connector=connector)
         return self._session
 

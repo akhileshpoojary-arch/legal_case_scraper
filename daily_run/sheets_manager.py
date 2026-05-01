@@ -218,7 +218,7 @@ class DailyRunSheetsManager:
             
             # Force refresh if nothing cached or cache older than 10 mins
             if not cached or (now - cached.get("at", 0) > 600):
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 sheet_ids = await loop.run_in_executor(
                     None, self._get_sheet_ids_for_court, court_type
                 )
@@ -249,7 +249,7 @@ class DailyRunSheetsManager:
                     "[%s] Sheet %s full (%d rows). Creating next.",
                     court_type.upper(), active_info["id"], active_info["row_count"],
                 )
-                sheet_ids = await asyncio.get_event_loop().run_in_executor(
+                sheet_ids = await asyncio.get_running_loop().run_in_executor(
                     None, self._get_sheet_ids_for_court, court_type
                 )
                 new_id = await self._create_new_sheet(court_type, len(sheet_ids) + 1)
@@ -266,7 +266,7 @@ class DailyRunSheetsManager:
         """Duplicate template, name it, register in the index sheet.
         Retries retryable failures until success.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         name = f"{_COURT_NAME_MAP[court_type]} {index}"
 
         attempt = 0
@@ -657,7 +657,7 @@ class DailyRunSheetsManager:
 
         import gspread
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def read_total_systems() -> int:
             now = time.monotonic()

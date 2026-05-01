@@ -6,6 +6,18 @@ import logging
 import sys
 
 
+def format_percent(done: int | float, total: int | float) -> str:
+    """Return a compact percentage string for progress logs."""
+    try:
+        total_f = float(total)
+        if total_f <= 0:
+            return "0.0%"
+        pct = max(0.0, min(100.0, (float(done) / total_f) * 100.0))
+        return f"{pct:.1f}%"
+    except Exception:
+        return "0.0%"
+
+
 def format_log_value(value: object) -> str:
     """Render a stable log value that stays readable when it contains spaces."""
     if value is None:
@@ -73,22 +85,22 @@ def stage_progress(index: int, total: int) -> str:
     """Format zero-based stage progress as current/total with done/left counts."""
     total = max(0, int(total))
     if total == 0:
-        return "0/0 done=0 left=0"
+        return "0/0 pct=0.0% done=0 left=0"
     done = min(max(0, int(index)), total)
     current = min(done + 1, total)
     left = max(total - done - 1, 0)
-    return f"{current}/{total} done={done} left={left}"
+    return f"{current}/{total} pct={format_percent(done, total)} done={done} left={left}"
 
 
 def descending_year_progress(current_year: int, start_year: int, end_year: int) -> str:
     """Format descending year progress for a block that moves end_year -> start_year."""
     total = max(0, int(end_year) - int(start_year) + 1)
     if total == 0:
-        return "0/0 done=0 left=0"
+        return "0/0 pct=0.0% done=0 left=0"
     done = min(max(int(end_year) - int(current_year), 0), total)
     current = min(done + 1, total)
     left = max(total - done - 1, 0)
-    return f"{current}/{total} done={done} left={left}"
+    return f"{current}/{total} pct={format_percent(done, total)} done={done} left={left}"
 
 
 def setup_logger(
