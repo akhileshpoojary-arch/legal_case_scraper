@@ -22,3 +22,4 @@ captcha_img/
 AppScriptCode/
 
 venv311/
+.venv/

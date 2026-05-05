@@ -16,6 +16,7 @@ import random
 import time
 from typing import Any
 
+from utils.logging_utils import format_kv_block
 from utils.http_client import BaseHTTPClient, create_http_client
 from utils.proxy import ProxyRotator
 
@@ -51,8 +52,10 @@ class SessionManager:
         semaphore_limit: int = 20,
         request_delay: float = 0.05,
         proxy_rotator: ProxyRotator | None = None,
+        name: str | None = None,
     ) -> None:
         self._client_type = client_type
+        self._name = name or client_type
         self._cookies = dict(cookies) if cookies else {}
         self._headers = dict(headers) if headers else {}
         self._max_failures = max_failures
@@ -80,10 +83,24 @@ class SessionManager:
         self._rotation_count += 1
         if self._proxy_rotator and self._current_proxy:
             await self._proxy_rotator.report_failure(self._current_proxy)
+        proxy_summary = (
+            self._proxy_rotator.stats_summary() if self._proxy_rotator else "no proxy pool"
+        )
         logger.warning(
-            "Rotating session (#%d) after %d consecutive failures",
-            self._rotation_count,
-            self._consecutive_failures,
+            format_kv_block(
+                f"[session:{self._name}] Rotation",
+                {
+                    "Session": {
+                        "rotation": self._rotation_count,
+                        "failures": self._consecutive_failures,
+                        "reason": self._last_failure_reason or "unknown",
+                    },
+                    "Proxy": {
+                        "current": self._proxy_label(self._current_proxy),
+                        "pool": proxy_summary,
+                    },
+                },
+            )
         )
         if self._client:
             await self._client.close()
@@ -143,6 +160,15 @@ class SessionManager:
         if "response" in name or "status" in msg:
             return "http_error"
         return name or "unknown_error"
+
+    @staticmethod
+    def _proxy_label(proxy_url: str | None) -> str:
+        if not proxy_url:
+            return "-"
+        try:
+            return proxy_url.split("@", 1)[1] if "@" in proxy_url else proxy_url
+        except Exception:
+            return "unknown"
 
     def consume_last_failure_reason(self) -> str | None:
         """Fetch and clear the last recorded failure reason."""

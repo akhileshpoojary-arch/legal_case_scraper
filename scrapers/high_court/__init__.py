@@ -40,6 +40,7 @@ class HighCourtScraper(BaseScraper):
             max_failures=10,
             semaphore_limit=MAX_CONCURRENT,
             request_delay=REQUEST_DELAY,
+            name="HC-party",
         )
         self._extractor = HCExtractor(self._sm)
         self._parser = HCParser()

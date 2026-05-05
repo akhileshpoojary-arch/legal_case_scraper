@@ -80,8 +80,8 @@ SCRAPER_RESULT_CELLS: dict[str, str] = {
 # ═══════════════════════════════════════════════════════════════
 #  CONCURRENCY  (env-driven for Railway auto-scaling)
 # ═══════════════════════════════════════════════════════════════
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 30))
-REQUEST_DELAY = 0.01
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 20))
+REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "0.03"))
 MAX_RETRIES = 5
 RETRY_DELAY = 1.0
 

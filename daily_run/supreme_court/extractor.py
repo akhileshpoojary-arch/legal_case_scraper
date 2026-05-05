@@ -11,6 +11,7 @@ from typing import Any
 from bs4 import BeautifulSoup
 
 from daily_run.config import VERBOSE_CAPTCHA_LOGS
+from utils.logging_utils import captcha_attempt_block
 from utils.session_utils import SessionManager
 
 logger = logging.getLogger("legal_scraper.daily_run.sc.extractor")
@@ -225,29 +226,21 @@ class SCIContinuousExtractor:
             site_result: str,
             *,
             will_retry: bool = False,
+            solver: str | None = None,
         ) -> None:
-            log = logger.info if VERBOSE_CAPTCHA_LOGS else logger.debug
-            if outcome == "success":
-                log(
-                    "[SC] CAPTCHA success: target={%s} case_no=%d attempt=%d/%d prediction=%s site_result=%s",
+            logger.debug(
+                captcha_attempt_block(
+                    "SC",
                     target_label,
-                    case_no,
                     attempt_no,
                     MAX_CAPTCHA_RETRIES,
-                    prediction if prediction else "-",
+                    prediction,
                     site_result,
+                    success=outcome == "success",
+                    will_retry=will_retry,
+                    case_no=case_no,
+                    solver=solver,
                 )
-                return
-
-            log(
-                "[SC] CAPTCHA fail: target={%s} case_no=%d attempt=%d/%d prediction=%s site_result=%s retry=%s",
-                target_label,
-                case_no,
-                attempt_no,
-                MAX_CAPTCHA_RETRIES,
-                prediction if prediction else "-",
-                site_result,
-                str(attempt_no) if will_retry else "stop",
             )
 
         for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
@@ -276,6 +269,7 @@ class SCIContinuousExtractor:
                     "fail",
                     "captcha_empty",
                     will_retry=attempt < MAX_CAPTCHA_RETRIES,
+                    solver=solver_name,
                 )
                 continue
 
@@ -310,6 +304,7 @@ class SCIContinuousExtractor:
                     "fail",
                     "no_response",
                     will_retry=False,
+                    solver=solver_name,
                 )
                 return {"_search_state": "retryable_error"}
 
@@ -335,6 +330,7 @@ class SCIContinuousExtractor:
                         "fail",
                         "invalid_captcha",
                         will_retry=attempt < MAX_CAPTCHA_RETRIES,
+                        solver=solver_name,
                     )
                     await asyncio.sleep(min(0.2 + random.random() * 0.3, 0.5))
                     continue
@@ -349,6 +345,7 @@ class SCIContinuousExtractor:
                         "fail",
                         "retryable_error",
                         will_retry=False,
+                        solver=solver_name,
                     )
                     return {"_search_state": "retryable_error"}
 
@@ -361,6 +358,7 @@ class SCIContinuousExtractor:
                         captcha_val,
                         "success",
                         "no_results",
+                        solver=solver_name,
                     )
                     return None
 
@@ -372,6 +370,7 @@ class SCIContinuousExtractor:
                     "fail",
                     "unexpected_error",
                     will_retry=False,
+                    solver=solver_name,
                 )
                 return {"_search_state": "retryable_error"}
 
@@ -392,6 +391,7 @@ class SCIContinuousExtractor:
                     captcha_val,
                     "success",
                     "no_results",
+                    solver=solver_name,
                 )
                 return None
 
@@ -403,6 +403,7 @@ class SCIContinuousExtractor:
                     captcha_val,
                     "success",
                     "ok",
+                    solver=solver_name,
                 )
                 return row_data
 
@@ -414,6 +415,7 @@ class SCIContinuousExtractor:
                 "fail",
                 "result_parse_error",
                 will_retry=False,
+                solver=solver_name,
             )
             return {"_search_state": "retryable_error"}
 

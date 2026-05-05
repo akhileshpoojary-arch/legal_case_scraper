@@ -103,12 +103,20 @@ class ProxyRotator:
         async with self._lock:
             now = time.monotonic()
             total = len(self._entries)
+            fallback: _ProxyEntry | None = None
 
             for _ in range(total):
                 entry = self._entries[self._index]
                 self._index = (self._index + 1) % total
-                if entry.banned_until <= now:
+                if entry.banned_until > now:
+                    continue
+                if entry.consecutive_failures == 0:
                     return entry.url
+                if fallback is None:
+                    fallback = entry
+
+            if fallback is not None:
+                return fallback.url
 
             # All banned — unban the one with highest historical success rate
             logger.warning("All proxies banned; unbanning best-performing one")
@@ -165,5 +173,10 @@ class ProxyRotator:
         active = sum(1 for e in self._entries if e.banned_until <= now)
         if not self._entries:
             return "no proxies"
+        banned = len(self._entries) - active
         avg_rate = sum(e.success_rate for e in self._entries) / len(self._entries)
-        return f"active={active}/{len(self._entries)} avg_success={avg_rate:.1%}"
+        max_recent_failures = max(e.consecutive_failures for e in self._entries)
+        return (
+            f"active={active}/{len(self._entries)} banned={banned} "
+            f"avg_success={avg_rate:.1%} max_recent_failures={max_recent_failures}"
+        )

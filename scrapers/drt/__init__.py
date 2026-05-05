@@ -40,6 +40,7 @@ class DRTScraper(BaseScraper):
             max_failures=MAX_FAILURES_BEFORE_ROTATE,
             semaphore_limit=MAX_CONCURRENT,
             request_delay=REQUEST_DELAY,
+            name="DRT",
         )
         self._extractor = DRTExtractor(self._sm)
         self._parser = DRTParser()

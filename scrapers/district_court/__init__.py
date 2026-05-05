@@ -89,6 +89,7 @@ class DistrictCourtScraper(BaseScraper):
             semaphore_limit=MAX_CONCURRENT,
             request_delay=REQUEST_DELAY,
             proxy_rotator=self._proxy_rotator,
+            name="DC-party-discovery",
         )
         self._discovery_extractor = DCExtractor(self._discovery_sm)
         self._parser = DCParser()
@@ -248,6 +249,7 @@ class DistrictCourtScraper(BaseScraper):
             semaphore_limit=5,
             request_delay=REQUEST_DELAY,
             proxy_rotator=self._proxy_rotator,
+            name=f"DC-party-search-{worker_id}",
         )
         extractor = DCExtractor(sm)
 
@@ -398,6 +400,7 @@ class DistrictCourtScraper(BaseScraper):
             semaphore_limit=5,
             request_delay=REQUEST_DELAY,
             proxy_rotator=self._proxy_rotator,
+            name=f"DC-party-detail-{worker_id}",
         )
         extractor = DCExtractor(sm)
 

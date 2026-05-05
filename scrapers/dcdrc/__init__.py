@@ -23,6 +23,7 @@ class DCDRCScraper(BaseScraper):
             semaphore_limit=MAX_CONCURRENT,
             request_delay=REQUEST_DELAY,
             headers=EJAGRITI_HEADERS,
+            name="DCDRC",
         )
         self._extractor = DCDRCExtractor(self._sm)
         self._parser = DCDRCParser()

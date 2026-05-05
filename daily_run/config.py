@@ -42,6 +42,8 @@ CONFIG_SHEET_HEADERS_ROW: tuple[str, ...] = (
     "sc_write_lock",
 )
 WRITE_LOCK_POLL_SECONDS = 10.0
+WRITE_LOCK_STALE_SECONDS = _env_int("WRITE_LOCK_STALE_SECONDS", 1800)
+CLUSTER_CONFIG_REFRESH_SECONDS = _env_int("CLUSTER_CONFIG_REFRESH_SECONDS", 60)
 CLUSTER_WORKER_ID = f"s{SYSTEM_SHARD_ID}"
 WORKER_HOSTNAME = (
     os.environ.get("RAILWAY_REPLICA_ID")
@@ -59,22 +61,22 @@ WORKER_LABEL = f"{CLUSTER_WORKER_ID}@{WORKER_HOSTNAME}:pid{WORKER_PROCESS_ID}"
 _CPU_COUNT = int(os.environ.get("WORKER_CPU_COUNT", multiprocessing.cpu_count() or 4))
 
 DETAIL_SESSION_POOL_SIZE = int(
-    os.environ.get("DETAIL_SESSION_POOL_SIZE", max(4, min(12, _CPU_COUNT * 3)))
+    os.environ.get("DETAIL_SESSION_POOL_SIZE", max(2, min(6, _CPU_COUNT * 2)))
 )
 SC_SEARCH_WORKERS = int(
-    os.environ.get("SC_SEARCH_WORKERS", max(3, min(12, _CPU_COUNT * 3)))
+    os.environ.get("SC_SEARCH_WORKERS", max(2, min(6, _CPU_COUNT * 2)))
 )
 HC_SEARCH_WORKERS = int(
-    os.environ.get("HC_SEARCH_WORKERS", max(2, min(6, _CPU_COUNT * 2)))
+    os.environ.get("HC_SEARCH_WORKERS", max(2, min(4, _CPU_COUNT)))
 )
 DC_SEARCH_WORKERS = int(
-    os.environ.get("DC_SEARCH_WORKERS", max(2, min(6, _CPU_COUNT * 2)))
+    os.environ.get("DC_SEARCH_WORKERS", max(2, min(4, _CPU_COUNT)))
 )
 HC_DETAIL_WORKERS = int(
-    os.environ.get("HC_DETAIL_WORKERS", max(8, min(24, _CPU_COUNT * 6)))
+    os.environ.get("HC_DETAIL_WORKERS", max(4, min(12, _CPU_COUNT * 3)))
 )
 DC_DETAIL_WORKERS = int(
-    os.environ.get("DC_DETAIL_WORKERS", max(8, min(24, _CPU_COUNT * 6)))
+    os.environ.get("DC_DETAIL_WORKERS", max(4, min(12, _CPU_COUNT * 3)))
 )
 
 _pdir = Path(__file__).resolve().parent
@@ -100,7 +102,8 @@ SC_START_YEAR = _env_int("SC_START_YEAR", 1950)
 SC_END_YEAR = _env_int("SC_END_YEAR", _CURRENT_YEAR)
 
 # ═══════════════════════════════════════════════════════════════
-#  BATCH SIZES — 5000 reduces Google Sheets API calls
+#  BATCH SIZES — lower defaults keep long JSON histories from filling RAM.
+#  Increase by env var on large machines if Google Sheets quota is the limit.
 # ═══════════════════════════════════════════════════════════════
 SHEET_FLUSH_CASES = int(os.environ.get("SHEET_FLUSH_CASES", 5000))
 WRITE_BATCH_SIZE = int(os.environ.get("WRITE_BATCH_SIZE", 5000))

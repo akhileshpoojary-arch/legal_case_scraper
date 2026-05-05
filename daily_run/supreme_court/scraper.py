@@ -16,6 +16,7 @@ from config import (
 )
 from daily_run.cluster import read_config_row_sync, slice_for_shard
 from daily_run.config import (
+    CLUSTER_CONFIG_REFRESH_SECONDS,
     CONFIG_WORKSHEET_NAME,
     DETAIL_SESSION_POOL_SIZE,
     SC_END_YEAR,
@@ -32,6 +33,9 @@ from daily_run.supreme_court.parser import build_sc_row
 from daily_run.sheets_manager import DailyRunSheetsManager
 from utils.logging_utils import (
     descending_year_progress,
+    format_duration,
+    format_kv_block,
+    format_main_progress,
     format_percent,
     sc_target_label,
     stage_progress,
@@ -79,6 +83,7 @@ class SCContinuousScraper:
             semaphore_limit=30,
             request_delay=0.1,
             proxy_rotator=self._proxy_rotator,
+            name="SC-primary",
         )
         # Each detail session gets independent cookies → independent captcha challenges
         n_detail = max(1, int(DETAIL_SESSION_POOL_SIZE))
@@ -89,9 +94,10 @@ class SCContinuousScraper:
                     client_type=HTTP_CLIENT,
                     headers=dict(hdr),
                     max_failures=10,
-                    semaphore_limit=30,
+                    semaphore_limit=20,
                     request_delay=0.1,
                     proxy_rotator=self._proxy_rotator,
+                    name=f"SC-detail-{len(self._detail_sessions) + 1}",
                 )
             )
         self._extractor = SCIContinuousExtractor(self._sm, self._detail_sessions)
@@ -102,9 +108,10 @@ class SCContinuousScraper:
                 client_type=HTTP_CLIENT,
                 headers=dict(hdr),
                 max_failures=10,
-                semaphore_limit=30,
+                semaphore_limit=20,
                 request_delay=0.1,
                 proxy_rotator=self._proxy_rotator,
+                name=f"SC-search-{len(self._search_extractors) + 1}",
             )
             self._search_extractors.append(
                 SCIContinuousExtractor(search_sm, self._detail_sessions)
@@ -114,6 +121,16 @@ class SCContinuousScraper:
         self._session_written_total = 0
         self._session_detail_total = 0
         self._session_stage_total = 0
+        self._cluster_total_systems = 0
+        self._cluster_slice_key: tuple[str, ...] = ()
+        self._cluster_last_refresh_at = 0.0
+
+    def _default_progress(self) -> dict:
+        return {
+            "case_type_idx": 0,
+            "year": SC_END_YEAR,
+            "case_no": 1,
+        }
 
     async def close(self) -> None:
         seen: set[int] = set()
@@ -136,58 +153,120 @@ class SCContinuousScraper:
         if p.exists():
             with p.open() as f:
                 return json.load(f)
-        return {
-            "case_type_idx": 0,
-            "year": SC_END_YEAR,
-            "case_no": 1,
-        }
+        return self._default_progress()
 
     def _save_progress(self, prog: dict) -> None:
         with open(SC_PROGRESS_FILE, "w") as f:
             json.dump(prog, f, indent=4)
 
+    def _refresh_case_type_slice(self, *, force: bool = False) -> bool:
+        now = time.monotonic()
+        if (
+            not force
+            and self._cluster_last_refresh_at
+            and now - self._cluster_last_refresh_at < CLUSTER_CONFIG_REFRESH_SECONDS
+        ):
+            return False
+
+        self._cluster_last_refresh_at = now
+        cfg = read_config_row_sync(self._sheets._index_sh, CONFIG_WORKSHEET_NAME)
+        total = max(1, int(cfg.get("total_systems", 1)))
+        case_types = slice_for_shard(list(SCI_CASE_TYPES), SYSTEM_SHARD_ID, total)
+        new_key = tuple(str(item.get("code", "")) for item in case_types)
+        had_assignment = self._cluster_total_systems > 0 or bool(self._cluster_slice_key)
+        changed = total != self._cluster_total_systems or new_key != self._cluster_slice_key
+
+        self._case_types_slice = case_types
+        self._cluster_total_systems = total
+        self._cluster_slice_key = new_key
+
+        if changed:
+            first = case_types[0]["name"] if case_types else "-"
+            last = case_types[-1]["name"] if case_types else "-"
+            logger.info(
+                format_kv_block(
+                    "[SC] Cluster assignment",
+                    {
+                        "Config": {
+                            "sheet": CONFIG_WORKSHEET_NAME,
+                            "raw_total_systems": cfg.get("raw_total_systems", "-"),
+                            "parsed_total_systems": total,
+                            "sc_write_lock": cfg.get("lock_sc", "-"),
+                        },
+                        "Worker": {
+                            "id": WORKER_LABEL,
+                            "shard_id": SYSTEM_SHARD_ID,
+                            "refresh_seconds": CLUSTER_CONFIG_REFRESH_SECONDS,
+                        },
+                        "Assignment": {
+                            "assigned_case_types": len(case_types),
+                            "first": first,
+                            "last": last,
+                            "search_workers": len(self._search_extractors),
+                            "detail_sessions": len(self._detail_sessions),
+                        },
+                    },
+                )
+            )
+        return changed and had_assignment
+
+    def _align_progress_to_case_type_slice(self, prog: dict) -> dict:
+        current_code = str(prog.get("case_type_code", "")).strip()
+        index_by_code = {
+            str(item.get("code", "")): idx
+            for idx, item in enumerate(self._case_types_slice)
+        }
+        if current_code and current_code in index_by_code:
+            old_idx = int(prog.get("case_type_idx", 0) or 0)
+            new_idx = index_by_code[current_code]
+            prog["case_type_idx"] = new_idx
+            logger.info(
+                "[SC] Cluster change kept current case type: type_code=%s old_idx=%d new_idx=%d",
+                current_code,
+                old_idx,
+                new_idx,
+            )
+            return prog
+
+        reset = self._default_progress()
+        logger.info(
+            "[SC] Cluster change moved current case type outside this worker slice; resetting local SC progress."
+        )
+        return reset
+
     async def run(self) -> None:
         logger.info("Starting SC Continuous 24/7 Scraper (Case Type + Case No)...")
 
-        def refresh_case_type_slice() -> None:
-            cfg = read_config_row_sync(
-                self._sheets._index_sh, CONFIG_WORKSHEET_NAME
-            )
-            total = max(1, int(cfg.get("total_systems", 1)))
-            self._case_types_slice = slice_for_shard(
-                list(SCI_CASE_TYPES), SYSTEM_SHARD_ID, total
-            )
-            logger.info(
-                "[SC] Worker slice: worker=%s total_systems=%d shard_id=%d case_types=%d search_workers=%d detail_sessions=%d",
-                WORKER_LABEL,
-                total,
-                SYSTEM_SHARD_ID,
-                len(self._case_types_slice),
-                len(self._search_extractors),
-                len(self._detail_sessions),
-            )
-
-        refresh_case_type_slice()
+        self._refresh_case_type_slice(force=True)
 
         while True:
             try:
+                assignment_changed = self._refresh_case_type_slice()
                 prog = self._load_progress()
+                if assignment_changed:
+                    prog = self._align_progress_to_case_type_slice(prog)
+                    self._save_progress(prog)
                 case_types = self._case_types_slice
+                if not case_types:
+                    logger.warning(
+                        "[SC] No case types assigned to shard_id=%d total_systems=%d. Waiting for config change.",
+                        SYSTEM_SHARD_ID,
+                        self._cluster_total_systems,
+                    )
+                    await asyncio.sleep(10)
+                    continue
 
                 ct_idx = prog.get("case_type_idx", 0)
                 if ct_idx >= len(case_types):
                     logger.info("COMPLETED FULL SC RUN! Resetting.")
-                    prog = {
-                        "case_type_idx": 0,
-                        "year": SC_END_YEAR,
-                        "case_no": 1,
-                    }
+                    prog = self._default_progress()
                     self._save_progress(prog)
                     continue
 
                 ct = case_types[ct_idx]
                 ct_code = ct["code"]
                 ct_name = ct["name"]
+                prog["case_type_code"] = ct_code
 
                 year = prog.get("year", SC_END_YEAR)
                 if year < SC_START_YEAR:
@@ -206,15 +285,18 @@ class SCContinuousScraper:
                 target_label = sc_target_label(ct_name, ct_code, year)
 
                 logger.info(
-                    "[SC] Selection ready: worker=%s target={%s} next_case_no=%d progress=case_types:%s years:%s sheet_flush_at=%d session_written=%d session_detail_ok=%d",
-                    WORKER_LABEL,
-                    target_label,
-                    case_no_start,
-                    case_type_progress,
-                    years_progress,
-                    max(1, int(SHEET_FLUSH_CASES)),
-                    self._session_written_total,
-                    self._session_detail_total,
+                    format_main_progress(
+                        court="SUPREME COURT",
+                        progress_name="case_type_progress",
+                        current_name=ct_name,
+                        current_code=ct_code,
+                        completed=ct_idx,
+                        total=total_case_types,
+                        cases_collected=0,
+                        written=self._session_written_total,
+                        write_buffer=0,
+                        write_batch_size=max(1, int(SHEET_FLUSH_CASES)),
+                    )
                 )
 
                 batch_results: list[dict[str, Any]] = []
@@ -329,7 +411,18 @@ class SCContinuousScraper:
                             if isinstance(result, dict)
                             else None
                         )
-                        if search_state in {"captcha_error", "retryable_error"}:
+                        if search_state == "captcha_error":
+                            extractor.invalidate_tokens()
+                            scid = tok_name = tok_value = None
+                            logger.warning(
+                                "[SC] Skipping case_no=%d after CAPTCHA exhaustion",
+                                case_no,
+                            )
+                            consecutive_empty += 1
+                            case_no += search_stride
+                            await asyncio.sleep(0.25)
+                            continue
+                        if search_state == "retryable_error":
                             extractor.invalidate_tokens()
                             scid = tok_name = tok_value = None
                             await asyncio.sleep(0.25)
@@ -401,35 +494,19 @@ class SCContinuousScraper:
                             metrics = ex.snapshot_search_metrics()
                             for key in metric_totals:
                                 metric_totals[key] += int(metrics.get(key, 0))
-                        detail_done = detail_success_total + detail_failure_total
-                        captcha_accept_rate = format_percent(
-                            metric_totals["captcha_accepted"],
-                            max(metric_totals["captcha_accepted"] + metric_totals["captcha_rejected"], 1),
-                        )
                         logger.info(
-                            "[SC] Pipeline telemetry: worker=%s target={%s} case_no_start=%d searched_upto=%d hits=%d hit_rate=%s detail_started=%d detail_done=%d detail_ok=%d detail_fail=%d detail_left=%d detail_pct=%s in_flight=%d buffer=%d/%d buffer_pct=%s stage_written=%d session_written=%d captcha_attempts=%d captcha_accept_rate=%s no_records=%d retryable=%d",
-                            WORKER_LABEL,
-                            target_label,
-                            case_no_start,
-                            max_searched_case_no,
-                            consumed_results,
-                            format_percent(consumed_results, max(metric_totals["attempts"], 1)),
-                            consumed_results,
-                            detail_done,
-                            detail_success_total,
-                            detail_failure_total,
-                            max(consumed_results - detail_done, 0),
-                            format_percent(detail_done, max(consumed_results, 1)),
-                            len(pending_detail_tasks),
-                            len(batch_results),
-                            max(1, int(SHEET_FLUSH_CASES)),
-                            format_percent(len(batch_results), max(1, int(SHEET_FLUSH_CASES))),
-                            written_total,
-                            self._session_written_total + written_total,
-                            metric_totals["attempts"],
-                            captcha_accept_rate,
-                            metric_totals["no_records"],
-                            metric_totals["retryable_errors"],
+                            format_main_progress(
+                                court="SUPREME COURT",
+                                progress_name="case_type_progress",
+                                current_name=ct_name,
+                                current_code=ct_code,
+                                completed=ct_idx,
+                                total=total_case_types,
+                                cases_collected=detail_success_total,
+                                written=self._session_written_total + written_total,
+                                write_buffer=len(batch_results),
+                                write_batch_size=max(1, int(SHEET_FLUSH_CASES)),
+                            )
                         )
                         # Log ensemble accuracy if available
                         try:
@@ -486,39 +563,18 @@ class SCContinuousScraper:
                     max(captcha_totals["captcha_accepted"] + captcha_totals["captcha_rejected"], 1),
                 )
                 logger.info(
-                    "[SC] Captcha summary: worker=%s target={%s} attempts=%d solved=%d accepted=%d rejected=%d accept_rate=%s empty=%d no_image=%d exhausted=%d retryable=%d",
-                    WORKER_LABEL,
+                    "[SC] Stage done: target={%s} hits=%d details=%d/%d written=%d captcha=%d/%d(%s) dur=%s",
                     target_label,
-                    captcha_totals["attempts"],
-                    captcha_totals["captcha_solved"],
-                    captcha_totals["captcha_accepted"],
-                    captcha_totals["captcha_rejected"],
-                    captcha_accept_rate,
-                    captcha_totals["captcha_empty"],
-                    captcha_totals["captcha_image_missing"],
-                    captcha_totals["captcha_exhausted"],
-                    captcha_totals["retryable_errors"],
-                )
-                logger.info(
-                    "[SC] Stage summary: worker=%s target={%s} case_no_start=%d searched_upto=%d duration=%.2fs search_hits=%d no_records=%d detail_ok=%d detail_fail=%d detail_success=%s written=%d session_written=%d session_detail_ok=%d stages_done=%d",
-                    WORKER_LABEL,
-                    target_label,
-                    case_no_start,
-                    max_searched_case_no,
-                    search_elapsed,
                     consumed_results,
-                    captcha_totals["no_records"],
                     detail_success_total,
-                    detail_failure_total,
-                    format_percent(
-                        detail_success_total,
-                        max(detail_success_total + detail_failure_total, 1),
-                    ),
+                    detail_success_total + detail_failure_total,
                     written_total,
-                    self._session_written_total,
-                    self._session_detail_total,
-                    self._session_stage_total,
+                    captcha_totals["captcha_accepted"],
+                    captcha_totals["attempts"],
+                    captcha_accept_rate,
+                    format_duration(search_elapsed),
                 )
+
 
                 logger.info(
                     "[SC] Block complete: worker=%s target={%s} exhausted_at_case_no=%d empty_cutoff=%d next_year=%d next_case_no=%d session_written=%d",

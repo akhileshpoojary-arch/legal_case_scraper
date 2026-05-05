@@ -12,10 +12,14 @@ from typing import Any
 
 from config import SERVICE_ACCOUNT_FILE
 from utils.sheet_dedup import row_dedup_key
-from daily_run.cluster import acquire_write_lock, release_write_lock
+from daily_run.cluster import (
+    acquire_write_lock,
+    ensure_config_worksheet_sync,
+    release_write_lock,
+)
 from daily_run.config import (
-    CLUSTER_WORKER_ID,
     CONFIG_WORKSHEET_NAME,
+    CONFIG_SHEET_HEADERS_ROW,
     ENFORCE_SHARED_DRIVE_DESTINATION,
     INDEX_SHEET_ID,
     MAX_ROWS_PER_SHEET,
@@ -23,6 +27,8 @@ from daily_run.config import (
     TEMPLATE_SHEET_ID,
     WRITE_BATCH_SIZE,
     WRITE_LOCK_POLL_SECONDS,
+    WRITE_LOCK_STALE_SECONDS,
+    WORKER_LABEL,
 )
 
 logger = logging.getLogger("legal_scraper.daily_run.sheets")
@@ -61,6 +67,11 @@ class DailyRunSheetsManager:
                 self._gc = gspread.service_account(filename=str(SERVICE_ACCOUNT_FILE))
                 self._index_sh = self._gc.open_by_key(INDEX_SHEET_ID)
                 self._index_ws = self._index_sh.worksheet("All court")
+                ensure_config_worksheet_sync(
+                    self._index_sh,
+                    CONFIG_WORKSHEET_NAME,
+                    CONFIG_SHEET_HEADERS_ROW,
+                )
                 break
             except Exception as e:
                 reason = DailyRunSheetsManager._extract_error_reason(e)
@@ -683,8 +694,9 @@ class DailyRunSheetsManager:
                 self._index_sh,
                 CONFIG_WORKSHEET_NAME,
                 court_type,
-                CLUSTER_WORKER_ID,
+                WORKER_LABEL,
                 WRITE_LOCK_POLL_SECONDS,
+                WRITE_LOCK_STALE_SECONDS,
             )
         try:
 
@@ -864,5 +876,5 @@ class DailyRunSheetsManager:
                     self._index_sh,
                     CONFIG_WORKSHEET_NAME,
                     court_type,
-                    CLUSTER_WORKER_ID,
+                    WORKER_LABEL,
                 )

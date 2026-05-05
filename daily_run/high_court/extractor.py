@@ -11,6 +11,7 @@ from typing import Any
 
 from config import COMMON_HEADERS
 from daily_run.config import HC_MAX_DETAIL_RETRIES, TESTING, VERBOSE_CAPTCHA_LOGS
+from utils.logging_utils import captcha_attempt_block, format_kv_block, format_percent
 from utils.session_utils import SessionManager
 
 logger = logging.getLogger("legal_scraper.daily_run.hc.extractor")
@@ -308,49 +309,35 @@ class HCContinuousExtractor:
             *,
             total: int | None = None,
             will_retry: bool = False,
+            solver: str | None = None,
         ) -> None:
-            log = logger.info if VERBOSE_CAPTCHA_LOGS else logger.debug
-            if outcome == "success":
-                log(
-                    "[HC] CAPTCHA success: target={%s} attempt=%d/%d prediction=%s site_result=%s total=%d",
+            logger.debug(
+                captcha_attempt_block(
+                    "HC",
                     target_label,
                     attempt_no,
                     MAX_CAPTCHA_RETRIES,
-                    prediction if prediction else "-",
+                    prediction,
                     site_result,
-                    max(0, int(total or 0)),
+                    success=outcome == "success",
+                    will_retry=will_retry,
+                    total=max(0, int(total or 0)) if outcome == "success" else None,
+                    solver=solver,
                 )
-                return
-
-            log(
-                "[HC] CAPTCHA fail: target={%s} attempt=%d/%d prediction=%s site_result=%s retry=%s",
-                target_label,
-                attempt_no,
-                MAX_CAPTCHA_RETRIES,
-                prediction if prediction else "-",
-                site_result,
-                str(attempt_no) if will_retry else "stop",
             )
 
         def log_summary(state: str, total: int = 0) -> None:
-            solved = max(0, int(stats["captcha_solved"]))
             accepted = max(0, int(stats["captcha_accepted"]))
             rejected = max(0, int(stats["captcha_rejected"]))
-            accept_rate = (accepted / solved * 100.0) if solved else 0.0
+            rate = format_percent(accepted, max(accepted + rejected, 1))
             logger.info(
-                "[HC] Search summary: target={%s} result=%s cases_found=%d captcha_attempts=%d solved=%d accepted=%d rejected=%d accept_rate=%.1f%% empty=%d no_image=%d transport=%d session_refresh=%d",
-                target_label,
+                "[HC] Search done: result=%s cases=%d captcha=%d/%d(%s) | %s",
                 state,
                 total,
-                stats["attempts"],
-                solved,
                 accepted,
-                rejected,
-                accept_rate,
-                stats["captcha_empty"],
-                stats["captcha_image_missing"],
-                stats["transport_failures"],
-                stats["session_refresh"],
+                stats["attempts"],
+                rate,
+                target_label,
             )
 
         for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
@@ -380,6 +367,7 @@ class HCContinuousExtractor:
                     "fail",
                     "captcha_empty",
                     will_retry=attempt < MAX_CAPTCHA_RETRIES,
+                    solver=solver_name,
                 )
                 continue
 
@@ -414,6 +402,7 @@ class HCContinuousExtractor:
                     "fail",
                     "no_response",
                     will_retry=attempt < MAX_CAPTCHA_RETRIES,
+                    solver=solver_name,
                 )
                 continue
 
@@ -432,6 +421,7 @@ class HCContinuousExtractor:
                     "fail",
                     "error_val" if is_error_val else "invalid_captcha",
                     will_retry=attempt < MAX_CAPTCHA_RETRIES,
+                    solver=solver_name,
                 )
                 if is_error_val:
                     consecutive_error_val += 1
@@ -453,6 +443,7 @@ class HCContinuousExtractor:
                     "fail",
                     "session_expired",
                     will_retry=attempt < MAX_CAPTCHA_RETRIES,
+                    solver=solver_name,
                 )
                 await self._sm.force_refresh(HC_HOME, HC_HEADERS)
                 continue
@@ -467,6 +458,7 @@ class HCContinuousExtractor:
                     "success",
                     "no_results",
                     total=0,
+                    solver=solver_name,
                 )
                 log_summary("no_results", 0)
                 return [], 0, "no_results"
@@ -485,6 +477,7 @@ class HCContinuousExtractor:
                     "fail",
                     "json_parse_error",
                     will_retry=attempt < MAX_CAPTCHA_RETRIES,
+                    solver=solver_name,
                 )
                 continue
             cases = _parse_con_field(data)
@@ -495,6 +488,7 @@ class HCContinuousExtractor:
                 "success",
                 "ok",
                 total=total,
+                solver=solver_name,
             )
             log_summary("ok", total)
             return cases, total, "ok"

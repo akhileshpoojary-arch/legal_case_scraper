@@ -3,19 +3,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import time
 from typing import Any
 from config import CSV_COLUMNS
 import config
 from config import SERVICE_ACCOUNT_FILE
 from daily_run.config import INDEX_SHEET_ID
 from scrapers.base import BaseScraper
-from utils.company_augment import generate_search_patterns
+from utils.company_augment import CompanySearchMatcher, build_company_search_plan
 from utils.party_search import cell_matches_party_query
 
 logger = logging.getLogger("legal_scraper.daily_run.sheet_search")
 
 _COURT_COL_MAP = {"dc": "A", "hc": "B", "sc": "C"}
+_SHEET_SEARCH_DELAY_SECONDS = float(os.environ.get("SHEET_SEARCH_DELAY_SECONDS", "2.0"))
+_SHEET_SEARCH_MAX_QUOTA_RETRIES = int(os.environ.get("SHEET_SEARCH_MAX_QUOTA_RETRIES", "8"))
 
 # Fields to search for party name matches
 _SEARCH_FIELDS = [
@@ -24,6 +28,19 @@ _SEARCH_FIELDS = [
     "petitioner",
     "otherPetitioner",
 ]
+_HISTORY_FIELDS = {
+    "listingHistory",
+    "applicationDetails",
+    "orderHistory",
+    "applicationHistory",
+}
+_PRIMARY_FIELDS = {
+    "caseNumber",
+    "respondent",
+    "petitioner",
+    "caseType",
+    "registrationDate",
+}
 
 class BaseSheetSearchScraper(BaseScraper):
     """Scraper that queries Google Sheets instead of live websites."""
@@ -50,14 +67,25 @@ class BaseSheetSearchScraper(BaseScraper):
         loop = asyncio.get_running_loop()
         entity_type = getattr(config, "ENTITY_TYPE", "individual")
 
-        augmented_patterns: list[re.Pattern[str]] | None = None
+        company_matcher: CompanySearchMatcher | None = None
         if entity_type == "company":
-            augmented_patterns = generate_search_patterns(party_name)
+            search_plan = build_company_search_plan(party_name)
+            company_matcher = search_plan.matcher()
             logger.info(
-                "[%s] Company mode: %d search variants for '%s'",
+                "[%s] Company search plan:\n"
+                "  Query      : %s\n"
+                "  Normalized : %s\n"
+                "  Core       : %s\n"
+                "  Variants   : %d\n"
+                "  Keywords   : %s\n"
+                "  Score min  : %d",
                 self.COURT_TYPE.upper(),
-                len(augmented_patterns),
                 party_name,
+                search_plan.normalized_name or "-",
+                search_plan.core_name or "-",
+                len(search_plan.variants),
+                "; ".join(search_plan.keyword_queries[:5]) or "-",
+                search_plan.score_threshold,
             )
 
         def get_sheet_ids() -> list[str]:
@@ -89,18 +117,32 @@ class BaseSheetSearchScraper(BaseScraper):
 
         def _cell_matches(cell_val: str) -> bool:
             """Check if a cell value matches the party query (augmented or basic)."""
-            if augmented_patterns:
-                for pat in augmented_patterns:
-                    if pat.search(cell_val):
-                        return True
-                return False
+            if company_matcher:
+                return company_matcher.matches(cell_val)
             return cell_matches_party_query(cell_val, party_name)
 
+        def _col_letter(col_idx: int) -> str:
+            from gspread.utils import rowcol_to_a1
+
+            return "".join(c for c in rowcol_to_a1(1, col_idx) if c.isalpha())
+
+        def _cell_from_block(block: list[list[str]], data_idx: int) -> str:
+            if data_idx < len(block) and block[data_idx]:
+                return str(block[data_idx][0]).strip()
+            return ""
+
+        def _row_dict_from_values(header: list[str], row_values: list[str]) -> dict[str, Any]:
+            return {
+                h.strip(): row_values[i] if i < len(row_values) else ""
+                for i, h in enumerate(header)
+            }
+
         def search_single_sheet(sh_id: str) -> list[dict[str, Any]]:
-            """Search a single sheet, retrying indefinitely on quota errors."""
+            """Search a single sheet without loading the whole spreadsheet grid."""
             attempt = 0
-            while True:
+            while attempt <= _SHEET_SEARCH_MAX_QUOTA_RETRIES:
                 try:
+                    started = time.monotonic()
                     sh = self._gc.open_by_key(sh_id)
                     ws = sh.get_worksheet(0)
                     header = ws.row_values(1)
@@ -117,80 +159,108 @@ class BaseSheetSearchScraper(BaseScraper):
                     if not search_col_indices:
                         return []
 
-                    all_values = ws.get_all_values()
-                    if len(all_values) <= 1:
+                    watched_fields = set(_SEARCH_FIELDS) | _HISTORY_FIELDS | _PRIMARY_FIELDS
+                    watched_indices: dict[str, int] = {}
+                    for i, h in enumerate(header):
+                        h_clean = h.strip()
+                        if h_clean in watched_fields:
+                            watched_indices[h_clean] = i + 1
+
+                    if not watched_indices:
                         return []
 
-                    matching_rows: list[dict[str, Any]] = []
-                    skip_until = 0
+                    ordered_cols = sorted(set(watched_indices.values()))
+                    col_blocks = ws.batch_get(
+                        [f"{_col_letter(col)}2:{_col_letter(col)}" for col in ordered_cols]
+                    )
+                    block_by_col = {
+                        col: col_blocks[i] if i < len(col_blocks) else []
+                        for i, col in enumerate(ordered_cols)
+                    }
+                    data_row_count = max((len(block) for block in col_blocks), default=0)
+                    if data_row_count <= 0:
+                        return []
 
-                    for row_idx in range(1, len(all_values)):
-                        if row_idx < skip_until:
+                    def value_for(field: str, data_idx: int) -> str:
+                        col_idx = watched_indices.get(field)
+                        if not col_idx:
+                            return ""
+                        return _cell_from_block(block_by_col.get(col_idx, []), data_idx)
+
+                    groups: list[tuple[int, int]] = []
+                    skip_until = -1
+
+                    for data_idx in range(data_row_count):
+                        if data_idx <= skip_until:
                             continue
 
-                        row_data = all_values[row_idx]
                         found = False
                         for col_idx_0 in search_col_indices.values():
-                            if col_idx_0 - 1 < len(row_data):
-                                cell_val = row_data[col_idx_0 - 1]
-                                if cell_val and _cell_matches(str(cell_val)):
-                                    found = True
-                                    break
+                            cell_val = _cell_from_block(
+                                block_by_col.get(col_idx_0, []), data_idx
+                            )
+                            if cell_val and _cell_matches(cell_val):
+                                found = True
+                                break
 
                         if found:
-                            row_dict: dict[str, Any] = {}
-                            for i, h in enumerate(header):
-                                if i < len(row_data):
-                                    row_dict[h.strip()] = row_data[i]
-                                else:
-                                    row_dict[h.strip()] = ""
-                            row_dict["partyName"] = party_name
-                            matching_rows.append(row_dict)
+                            end_idx = data_idx
 
-                            # Fetch continuation rows (spillover listing/application data)
-                            peek_idx = row_idx + 1
-                            while peek_idx < len(all_values):
-                                next_row_data = all_values[peek_idx]
-                                has_r_or_s = False
-                                has_primary = False
-
-                                for i, cell in enumerate(next_row_data):
-                                    val = str(cell).strip()
-                                    if not val:
-                                        continue
-
-                                    h_name = header[i].strip() if i < len(header) else ""
-                                    if h_name in ("listingHistory", "applicationDetails", "orderHistory", "applicationHistory"):
-                                        has_r_or_s = True
-                                    elif h_name in ("caseNumber", "respondent", "petitioner", "caseType", "registrationDate"):
-                                        has_primary = True
-
-                                # Stop if we hit a new distinct case or a totally empty row
-                                if has_primary or not has_r_or_s:
+                            peek_idx = data_idx + 1
+                            while peek_idx < data_row_count:
+                                has_history = any(
+                                    value_for(field, peek_idx) for field in _HISTORY_FIELDS
+                                )
+                                has_primary = any(
+                                    value_for(field, peek_idx) for field in _PRIMARY_FIELDS
+                                )
+                                if has_primary or not has_history:
                                     break
 
-                                # It's a continuation row, add it
-                                next_row_dict: dict[str, Any] = {}
-                                for i, h in enumerate(header):
-                                    key = h.strip()
-                                    if i < len(next_row_data):
-                                        next_row_dict[key] = next_row_data[i]
-                                    else:
-                                        next_row_dict[key] = ""
-
-                                # Don't propagate metadata/party data for the continuation row.
-                                # Aggressively clear ALL columns except JSON history columns.
-                                history_cols = {"listingHistory", "applicationDetails", "orderHistory", "applicationHistory"}
-                                for col in CSV_COLUMNS:
-                                    if col not in history_cols:
-                                        next_row_dict[col] = ""
-
-                                next_row_dict["_is_continuation"] = True
-                                matching_rows.append(next_row_dict)
-
+                                end_idx = peek_idx
                                 peek_idx += 1
 
-                            skip_until = peek_idx
+                            groups.append((data_idx + 2, end_idx + 2))
+                            skip_until = end_idx
+
+                    if not groups:
+                        logger.debug(
+                            "[%s] Sheet %s scanned %d rows: 0 matches",
+                            self.COURT_TYPE.upper(),
+                            sh_id[:8],
+                            data_row_count,
+                        )
+                        return []
+
+                    last_col = _col_letter(len(header))
+                    row_ranges = [
+                        f"A{start}:{last_col}{end}" for start, end in groups
+                    ]
+                    row_blocks = ws.batch_get(row_ranges)
+                    matching_rows: list[dict[str, Any]] = []
+
+                    for group_idx, block in enumerate(row_blocks):
+                        for row_offset, row_data in enumerate(block or []):
+                            row_dict = _row_dict_from_values(header, row_data)
+                            if row_offset == 0:
+                                row_dict["partyName"] = party_name
+                            else:
+                                for col in CSV_COLUMNS:
+                                    if col not in _HISTORY_FIELDS:
+                                        row_dict[col] = ""
+                                row_dict["_is_continuation"] = True
+                            matching_rows.append(row_dict)
+
+                    primary_count = len(groups)
+                    logger.info(
+                        "[%s] Sheet %s scanned %d rows in %.1fs: matches=%d sheet_rows=%d",
+                        self.COURT_TYPE.upper(),
+                        sh_id[:8],
+                        data_row_count,
+                        time.monotonic() - started,
+                        primary_count,
+                        len(matching_rows),
+                    )
 
                     return matching_rows
                 except Exception as e:
@@ -201,18 +271,20 @@ class BaseSheetSearchScraper(BaseScraper):
                             "Sheet %s: quota hit, waiting 60s then retrying (attempt %d)",
                             sh_id[:8], attempt,
                         )
-                        import time
                         time.sleep(60)
                         continue
                     logger.warning("Error searching sheet %s: %s", sh_id, e)
                     return []
-
-        # Each sheet uses ~3 API calls; 3s gap keeps us at ~20 sheets/min (~60 reads)
-        import time as _time
+            logger.warning(
+                "Sheet %s: quota retry limit reached after %d attempts",
+                sh_id[:8],
+                _SHEET_SEARCH_MAX_QUOTA_RETRIES,
+            )
+            return []
 
         for idx, sid in enumerate(sheet_ids):
             if idx > 0:
-                _time.sleep(3)
+                await asyncio.sleep(max(0.0, _SHEET_SEARCH_DELAY_SECONDS))
             try:
                 result = await loop.run_in_executor(None, search_single_sheet, sid)
                 all_matches.extend(result)

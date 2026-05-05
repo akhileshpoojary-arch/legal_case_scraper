@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 
 from config import COMMON_HEADERS
 from daily_run.config import TESTING, VERBOSE_CAPTCHA_LOGS
+from utils.logging_utils import captcha_attempt_block, format_kv_block, format_percent
 from utils.session_utils import SessionManager
 
 logger = logging.getLogger("legal_scraper.daily_run.dc.extractor")
@@ -329,50 +330,35 @@ class DCContinuousExtractor:
             *,
             total: int | None = None,
             will_retry: bool = False,
+            solver: str | None = None,
         ) -> None:
-            log = logger.info if VERBOSE_CAPTCHA_LOGS else logger.debug
-            if outcome == "success":
-                log(
-                    "[DC] CAPTCHA success: target={%s} attempt=%d/%d prediction=%s site_result=%s total=%d",
+            logger.debug(
+                captcha_attempt_block(
+                    "DC",
                     target_label,
                     attempt_no,
                     MAX_CAPTCHA_RETRIES,
-                    prediction if prediction else "-",
+                    prediction,
                     site_result,
-                    max(0, int(total or 0)),
+                    success=outcome == "success",
+                    will_retry=will_retry,
+                    total=max(0, int(total or 0)) if outcome == "success" else None,
+                    solver=solver,
                 )
-                return
-
-            log(
-                "[DC] CAPTCHA fail: target={%s} attempt=%d/%d prediction=%s site_result=%s retry=%s",
-                target_label,
-                attempt_no,
-                MAX_CAPTCHA_RETRIES,
-                prediction if prediction else "-",
-                site_result,
-                str(attempt_no) if will_retry else "stop",
             )
 
         def log_summary(state: str, total: int = 0) -> None:
-            solved = max(0, int(stats["captcha_solved"]))
             accepted = max(0, int(stats["captcha_accepted"]))
             rejected = max(0, int(stats["captcha_rejected"]))
-            accept_rate = (accepted / solved * 100.0) if solved else 0.0
+            rate = format_percent(accepted, max(accepted + rejected, 1))
             logger.info(
-                "[DC] Search summary: target={%s} result=%s cases_found=%d captcha_attempts=%d solved=%d accepted=%d rejected=%d accept_rate=%.1f%% empty=%d no_image=%d transport=%d parse=%d cutoff=%d",
-                target_label,
+                "[DC] Search done: result=%s cases=%d captcha=%d/%d(%s) | %s",
                 state,
                 total,
-                stats["attempts"],
-                solved,
                 accepted,
-                rejected,
-                accept_rate,
-                stats["captcha_empty"],
-                stats["captcha_image_missing"],
-                stats["transport_failures"],
-                stats["parse_failures"],
-                stats["consecutive_fail_cutoff"],
+                stats["attempts"],
+                rate,
+                target_label,
             )
 
         for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
@@ -393,6 +379,7 @@ class DCContinuousExtractor:
                         consec_fail < MAX_CAPTCHA_CONSEC_FAILS
                         and attempt < MAX_CAPTCHA_RETRIES
                     ),
+                    solver=solver_name,
                 )
                 if consec_fail >= MAX_CAPTCHA_CONSEC_FAILS:
                     stats["consecutive_fail_cutoff"] += 1
@@ -456,6 +443,7 @@ class DCContinuousExtractor:
                         consec_fail < MAX_CAPTCHA_CONSEC_FAILS
                         and attempt < MAX_CAPTCHA_RETRIES
                     ),
+                    solver=solver_name,
                 )
                 if consec_fail >= MAX_CAPTCHA_CONSEC_FAILS:
                     stats["consecutive_fail_cutoff"] += 1
@@ -474,6 +462,7 @@ class DCContinuousExtractor:
                     "fail",
                     "json_parse_error",
                     will_retry=attempt < MAX_CAPTCHA_RETRIES,
+                    solver=solver_name,
                 )
                 continue
 
@@ -494,6 +483,7 @@ class DCContinuousExtractor:
                         consec_fail < MAX_CAPTCHA_CONSEC_FAILS
                         and attempt < MAX_CAPTCHA_RETRIES
                     ),
+                    solver=solver_name,
                 )
                 if consec_fail >= MAX_CAPTCHA_CONSEC_FAILS:
                     stats["consecutive_fail_cutoff"] += 1
@@ -513,6 +503,7 @@ class DCContinuousExtractor:
                     "success",
                     "no_results",
                     total=0,
+                    solver=solver_name,
                 )
                 log_summary("no_results", 0)
                 return [], 0, "no_results"
@@ -566,6 +557,7 @@ class DCContinuousExtractor:
                 "success",
                 "ok",
                 total=len(cases),
+                solver=solver_name,
             )
             log_summary("ok", len(cases))
             return cases, len(cases), "ok"

@@ -37,6 +37,7 @@ class SupremeCourtScraper(BaseScraper):
             max_failures=10,
             semaphore_limit=MAX_CONCURRENT,
             request_delay=REQUEST_DELAY,
+            name="SC-party",
         )
         self._extractor = SCIExtractor(self._sm)
         self._parser = SCIParser()

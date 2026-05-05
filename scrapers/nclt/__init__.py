@@ -32,6 +32,7 @@ class NCLTScraper(BaseScraper):
             max_failures=MAX_FAILURES_BEFORE_ROTATE,
             semaphore_limit=MAX_CONCURRENT,
             request_delay=REQUEST_DELAY,
+            name="NCLT",
         )
         self._extractor = NCLTExtractor(self._sm)
         self._parser = NCLTParser()

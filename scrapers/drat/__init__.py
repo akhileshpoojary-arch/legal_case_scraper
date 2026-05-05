@@ -42,6 +42,7 @@ class DRATScraper(BaseScraper):
             max_failures=MAX_FAILURES_BEFORE_ROTATE,
             semaphore_limit=MAX_CONCURRENT,
             request_delay=REQUEST_DELAY,
+            name="DRAT",
         )
         self._extractor = DRATExtractor(self._sm)
         self._parser = DRATParser()

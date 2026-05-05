@@ -22,6 +22,7 @@ class NCDRCScraper(BaseScraper):
             semaphore_limit=MAX_CONCURRENT,
             request_delay=REQUEST_DELAY,
             headers=EJAGRITI_HEADERS,
+            name="NCDRC",
         )
         self._extractor = NCDRCExtractor(self._sm)
         self._parser = NCDRCParser()

@@ -22,6 +22,7 @@ from daily_run.cluster import (
     slice_for_shard,
 )
 from daily_run.config import (
+    CLUSTER_CONFIG_REFRESH_SECONDS,
     CONFIG_WORKSHEET_NAME,
     DC_DETAIL_WORKERS,
     DC_END_YEAR,
@@ -39,6 +40,9 @@ from daily_run.sheets_manager import DailyRunSheetsManager
 from utils.logging_utils import (
     dc_target_label,
     descending_year_progress,
+    format_duration,
+    format_kv_block,
+    format_main_progress,
     format_percent,
     stage_progress,
 )
@@ -65,6 +69,7 @@ class DCContinuousScraper:
             semaphore_limit=MAX_CONCURRENT,
             request_delay=REQUEST_DELAY,
             proxy_rotator=self._proxy_rotator,
+            name="DC-search",
         )
         # Each detail session gets independent cookies → independent captcha challenges
         n_detail = max(1, int(DETAIL_SESSION_POOL_SIZE))
@@ -75,9 +80,10 @@ class DCContinuousScraper:
                     client_type=HTTP_CLIENT,
                     headers={},
                     max_failures=10,
-                    semaphore_limit=max(30, MAX_CONCURRENT // 2),
+                    semaphore_limit=max(4, min(20, MAX_CONCURRENT // 2)),
                     request_delay=REQUEST_DELAY,
                     proxy_rotator=self._proxy_rotator,
+                    name=f"DC-detail-{len(self._detail_sessions) + 1}",
                 )
             )
         self._extractor = DCContinuousExtractor(self._sm, self._detail_sessions)
@@ -94,6 +100,20 @@ class DCContinuousScraper:
         self._session_written_total = 0
         self._session_detail_total = 0
         self._session_stage_total = 0
+        self._cluster_total_systems = 0
+        self._cluster_slice_key: tuple[str, ...] = ()
+        self._cluster_last_refresh_at = 0.0
+
+    def _default_progress(self) -> dict:
+        return {
+            "state_idx": 0,
+            "dist_idx": 0,
+            "complex_idx": 0,
+            "est_idx": 0,
+            "case_type_idx": 0,
+            "year": DC_END_YEAR,
+            "status_idx": 0,
+        }
 
     async def close(self) -> None:
         seen: set[int] = set()
@@ -109,51 +129,109 @@ class DCContinuousScraper:
         if p.exists():
             with p.open() as f:
                 return json.load(f)
-        return {
-            "state_idx": 0,
-            "dist_idx": 0,
-            "complex_idx": 0,
-            "est_idx": 0,
-            "case_type_idx": 0,
-            "year": DC_END_YEAR,
-            "status_idx": 0,
-        }
+        return self._default_progress()
 
     def _save_progress(self, prog: dict) -> None:
         with open(DC_PROGRESS_FILE, "w") as f:
             json.dump(prog, f, indent=4)
 
+    def _refresh_state_slice(self, *, force: bool = False) -> bool:
+        now = time.monotonic()
+        if (
+            not force
+            and self._cluster_last_refresh_at
+            and now - self._cluster_last_refresh_at < CLUSTER_CONFIG_REFRESH_SECONDS
+        ):
+            return False
+
+        self._cluster_last_refresh_at = now
+        cfg = read_config_row_sync(self._sheets._index_sh, CONFIG_WORKSHEET_NAME)
+        total = max(1, int(cfg.get("total_systems", 1)))
+        states = slice_for_shard(list(DC_STATES), SYSTEM_SHARD_ID, total)
+        new_key = tuple(str(item.get("state_code", "")) for item in states)
+        had_assignment = self._cluster_total_systems > 0 or bool(self._cluster_slice_key)
+        changed = total != self._cluster_total_systems or new_key != self._cluster_slice_key
+
+        self._states_slice = states
+        self._cluster_total_systems = total
+        self._cluster_slice_key = new_key
+
+        if changed:
+            first = states[0]["name"] if states else "-"
+            last = states[-1]["name"] if states else "-"
+            logger.info(
+                format_kv_block(
+                    "[DC] Cluster assignment",
+                    {
+                        "Config": {
+                            "sheet": CONFIG_WORKSHEET_NAME,
+                            "raw_total_systems": cfg.get("raw_total_systems", "-"),
+                            "parsed_total_systems": total,
+                            "dc_write_lock": cfg.get("lock_dc", "-"),
+                        },
+                        "Worker": {
+                            "id": WORKER_LABEL,
+                            "shard_id": SYSTEM_SHARD_ID,
+                            "refresh_seconds": CLUSTER_CONFIG_REFRESH_SECONDS,
+                        },
+                        "Assignment": {
+                            "assigned_states": len(states),
+                            "first": first,
+                            "last": last,
+                            "detail_workers": max(1, int(DC_DETAIL_WORKERS)),
+                        },
+                    },
+                )
+            )
+        return changed and had_assignment
+
+    def _align_progress_to_state_slice(self, prog: dict) -> dict:
+        current_code = str(prog.get("state_code", "")).strip()
+        index_by_code = {
+            str(item.get("state_code", "")): idx
+            for idx, item in enumerate(self._states_slice)
+        }
+        if current_code and current_code in index_by_code:
+            old_idx = int(prog.get("state_idx", 0) or 0)
+            new_idx = index_by_code[current_code]
+            prog["state_idx"] = new_idx
+            logger.info(
+                "[DC] Cluster change kept current state: state_code=%s old_idx=%d new_idx=%d",
+                current_code,
+                old_idx,
+                new_idx,
+            )
+            return prog
+
+        reset = self._default_progress()
+        logger.info(
+            "[DC] Cluster change moved current state outside this worker slice; resetting local DC progress."
+        )
+        return reset
+
     async def run(self) -> None:
         logger.info("Starting DC Continuous 24/7 Scraper...")
 
-        def refresh_state_slice() -> None:
-            cfg = read_config_row_sync(
-                self._sheets._index_sh, CONFIG_WORKSHEET_NAME
-            )
-            total = max(1, int(cfg.get("total_systems", 1)))
-            self._states_slice = slice_for_shard(
-                list(DC_STATES), SYSTEM_SHARD_ID, total
-            )
-            logger.info(
-                "[DC] Worker slice: worker=%s total_systems=%d shard_id=%d states=%d detail_workers=%d",
-                WORKER_LABEL,
-                total,
-                SYSTEM_SHARD_ID,
-                len(self._states_slice),
-                max(1, int(DC_DETAIL_WORKERS)),
-            )
-
-        refresh_state_slice()
+        self._refresh_state_slice(force=True)
 
         while True:
             try:
+                assignment_changed = self._refresh_state_slice()
                 states = self._states_slice
                 if not states:
-                    logger.error("No states found. Retrying in 10s...")
+                    logger.warning(
+                        "[DC] No states assigned to shard_id=%d total_systems=%d. Waiting for config change.",
+                        SYSTEM_SHARD_ID,
+                        self._cluster_total_systems,
+                    )
                     await asyncio.sleep(10)
                     continue
 
                 prog = self._load_progress()
+                if assignment_changed:
+                    prog = self._align_progress_to_state_slice(prog)
+                    self._save_progress(prog)
+
                 legacy_pending = prog.pop("pending", [])
                 if legacy_pending:
                     logger.info(
@@ -165,20 +243,13 @@ class DCContinuousScraper:
                 s_idx = prog.get("state_idx", 0)
 
                 if s_idx >= len(states):
-                    prog = {
-                        "state_idx": 0,
-                        "dist_idx": 0,
-                        "complex_idx": 0,
-                        "est_idx": 0,
-                        "case_type_idx": 0,
-                        "year": DC_END_YEAR,
-                        "status_idx": 0,
-                    }
+                    prog = self._default_progress()
                     self._save_progress(prog)
                     continue
 
                 state = states[s_idx]
                 state_code = state["state_code"]
+                prog["state_code"] = state_code
 
                 districts = self._district_cache.get(state_code)
                 if districts is None:
@@ -304,19 +375,18 @@ class DCContinuousScraper:
                 )
 
                 logger.info(
-                    "[DC] Selection ready: worker=%s target={%s} progress=states:%s districts:%s complexes:%s establishments:%s case_types:%s years:%s statuses:%s sheet_flush_at=%d session_written=%d session_detail_ok=%d",
-                    WORKER_LABEL,
-                    target_label,
-                    state_progress,
-                    district_progress,
-                    complex_progress,
-                    establishment_progress,
-                    case_type_progress,
-                    year_progress,
-                    status_progress,
-                    max(1, int(SHEET_FLUSH_CASES)),
-                    self._session_written_total,
-                    self._session_detail_total,
+                    format_main_progress(
+                        court="DISTRICT COURT",
+                        progress_name="state_progress",
+                        current_name=state["name"],
+                        current_code=state_code,
+                        completed=s_idx,
+                        total=len(states),
+                        cases_collected=0,
+                        written=self._session_written_total,
+                        write_buffer=0,
+                        write_batch_size=max(1, int(SHEET_FLUSH_CASES)),
+                    )
                 )
 
                 search_started = time.monotonic()
@@ -379,6 +449,12 @@ class DCContinuousScraper:
                     worker_label=WORKER_LABEL,
                     key_func=case_key,
                     session_written_base=self._session_written_total,
+                    progress_court="DISTRICT COURT",
+                    progress_name="state_progress",
+                    progress_current_name=state["name"],
+                    progress_current_code=state_code,
+                    progress_completed=s_idx,
+                    progress_total=len(states),
                 )
 
                 detail_success_total = pipe_stats.detail_success
@@ -390,22 +466,15 @@ class DCContinuousScraper:
                 self._session_detail_total += detail_success_total
                 self._session_written_total += written_total
                 logger.info(
-                    "[DC] Stage summary: worker=%s target={%s} total=%.2fs search_total=%d detail_ok=%d detail_fail=%d detail_success=%s duplicate_skips=%d written=%d session_written=%d session_detail_ok=%d stages_done=%d",
-                    WORKER_LABEL,
+                    "[DC] Stage done: target={%s} cases=%d details=%d/%d written=%d dups=%d dur=%s session_total=%d",
                     target_label,
-                    search_elapsed,
                     count,
                     detail_success_total,
-                    detail_failure_total,
-                    format_percent(
-                        detail_success_total,
-                        max(detail_success_total + detail_failure_total, 1),
-                    ),
-                    pipe_stats.duplicates_skipped,
+                    detail_success_total + detail_failure_total,
                     written_total,
+                    pipe_stats.duplicates_skipped,
+                    format_duration(search_elapsed),
                     self._session_written_total,
-                    self._session_detail_total,
-                    self._session_stage_total,
                 )
 
                 prog["status_idx"] += 1
