@@ -1,11 +1,11 @@
 """
-Single entrypoint that runs all three court scrapers concurrently.
+Single entrypoint that runs all three court scrapers concurrently — the 24/7
+collector. This is the long-running "console" process.
 
-Used by Railway.app Procfile / Dockerfile as the main process.
-All three scrapers share the same event loop but operate on different
-court websites with independent HTTP sessions.
+All three scrapers share the same event loop but operate on different court
+websites with independent HTTP sessions.
 
-Handles SIGTERM for graceful Railway shutdown.
+Handles SIGTERM/SIGINT for graceful shutdown (e.g. `docker stop`).
 """
 
 import asyncio
@@ -21,8 +21,17 @@ from daily_run.supreme_court.scraper import SCContinuousScraper
 from daily_run.config import (
     CLUSTER_CONFIG_REFRESH_SECONDS,
     CONFIG_WORKSHEET_NAME,
+    DC_END_YEAR,
+    DC_START_YEAR,
+    HC_END_YEAR,
+    HC_START_YEAR,
     INDEX_SHEET_ID,
+    SC_EMPTY_JUMP_ENABLED,
+    SC_END_YEAR,
+    SC_START_YEAR,
+    SHEET_FLUSH_CASES,
     SYSTEM_SHARD_ID,
+    WRITE_BATCH_SIZE,
     WORKER_LABEL,
 )
 from utils.logging_utils import format_kv_block, setup_logger
@@ -54,7 +63,7 @@ async def main() -> None:
     _shutdown_event = asyncio.Event()
 
     logger.info("=" * 60)
-    logger.info("  LEGAL CASE SCRAPER — ALL COURTS (Railway)")
+    logger.info("  LEGAL CASE SCRAPER — ALL COURTS (24/7 collector)")
     logger.info("=" * 60)
     logger.info(
         format_kv_block(
@@ -68,6 +77,14 @@ async def main() -> None:
                     "index_sheet_id": INDEX_SHEET_ID,
                     "worksheet": CONFIG_WORKSHEET_NAME,
                     "refresh_seconds": CLUSTER_CONFIG_REFRESH_SECONDS,
+                    "sheet_flush_cases": SHEET_FLUSH_CASES,
+                    "write_batch_size": WRITE_BATCH_SIZE,
+                    "sc_empty_jump": SC_EMPTY_JUMP_ENABLED,
+                },
+                "Year ranges": {
+                    "district_court": f"{DC_START_YEAR}-{DC_END_YEAR}",
+                    "high_court": f"{HC_START_YEAR}-{HC_END_YEAR}",
+                    "supreme_court": f"{SC_START_YEAR}-{SC_END_YEAR}",
                 },
             },
         )
@@ -80,7 +97,7 @@ async def main() -> None:
     )
     logger.info("Configured default executor workers=%d", max_workers)
 
-    # Register signal handlers for graceful Railway shutdown
+    # Register signal handlers for graceful shutdown (docker stop / Ctrl-C)
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, lambda s=sig: _shutdown_event.set())
@@ -91,6 +108,25 @@ async def main() -> None:
     # Warm up captcha models once (shared across all scrapers)
     from utils.captcha import warm_up_reader
     warm_up_reader()
+
+    # One-time migration: if the local index is empty but data already exists in
+    # Google Sheets, import it once so search works immediately and the collector
+    # de-duplicates against it (no re-appending old cases). Idempotent; skipped on
+    # later starts once the index has rows. Manual equivalent:
+    #   python -m daily_run.case_index backfill
+    from daily_run.case_index import CaseIndex, backfill
+    index = CaseIndex.get_or_create()
+    if index.count() == 0:
+        logger.info("Case index is empty — running one-time backfill from Sheets...")
+        try:
+            await loop.run_in_executor(None, backfill)
+            logger.info("Backfill complete. Indexed %d cases.", index.count())
+        except Exception as exc:
+            logger.error(
+                "Backfill failed (%s). Continuing; run "
+                "`python -m daily_run.case_index backfill` manually to retry.",
+                exc,
+            )
 
     dc = DCContinuousScraper()
     hc = HCContinuousScraper()

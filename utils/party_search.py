@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Pattern
 
+from utils.normalize import _fold_unicode
+
 
 def _token_pattern(token: str) -> str:
     t = token.upper().strip().rstrip(".,;:")
@@ -73,6 +75,10 @@ def compile_party_fallback_patterns(query: str) -> list[Pattern[str]]:
 def cell_matches_party_query(cell: str, query: str) -> bool:
     if not cell or not query:
         return False
+    # Fold accents on both sides so 'JOSÉ' matches 'JOSE' (the index tokenizer
+    # folds the same way when it stores names).
+    cell = _fold_unicode(cell)
+    query = _fold_unicode(query)
     primary = compile_party_search_pattern(query)
     if primary.search(cell):
         return True

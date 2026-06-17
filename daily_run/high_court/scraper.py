@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
-from pathlib import Path
 from typing import Any
 
 from config import (
@@ -33,6 +31,8 @@ from daily_run.config import (
     HC_START_YEAR,
     SYSTEM_SHARD_ID,
     WORKER_LABEL,
+    load_progress_safe,
+    save_progress_atomic,
 )
 from daily_run.high_court.extractor import HCContinuousExtractor, HIGH_COURTS
 from daily_run.high_court.parser import build_hc_row, parse_detail_html
@@ -107,6 +107,30 @@ class HCContinuousScraper:
             "status_idx": 0,
         }
 
+    def _reset_from_state(self, prog: dict) -> None:
+        prog["bench_idx"] = 0
+        self._reset_from_bench(prog)
+
+    def _reset_from_bench(self, prog: dict) -> None:
+        prog["case_type_idx"] = 0
+        self._reset_from_case_type(prog)
+
+    def _reset_from_case_type(self, prog: dict) -> None:
+        prog["year"] = HC_END_YEAR
+        prog["status_idx"] = 0
+
+    def _advance_state(self, prog: dict) -> None:
+        prog["state_idx"] = int(prog.get("state_idx", 0) or 0) + 1
+        self._reset_from_state(prog)
+
+    def _advance_bench(self, prog: dict) -> None:
+        prog["bench_idx"] = int(prog.get("bench_idx", 0) or 0) + 1
+        self._reset_from_bench(prog)
+
+    def _advance_case_type(self, prog: dict) -> None:
+        prog["case_type_idx"] = int(prog.get("case_type_idx", 0) or 0) + 1
+        self._reset_from_case_type(prog)
+
     async def close(self) -> None:
         seen: set[int] = set()
         for sm in self._detail_sessions:
@@ -117,15 +141,10 @@ class HCContinuousScraper:
             await sm.close()
 
     def _load_progress(self) -> dict:
-        p = Path(HC_PROGRESS_FILE)
-        if p.exists():
-            with p.open() as f:
-                return json.load(f)
-        return self._default_progress()
+        return load_progress_safe(HC_PROGRESS_FILE, self._default_progress())
 
     def _save_progress(self, prog: dict) -> None:
-        with open(HC_PROGRESS_FILE, "w") as f:
-            json.dump(prog, f, indent=4)
+        save_progress_atomic(HC_PROGRESS_FILE, prog)
 
     def _refresh_court_slice(self, *, force: bool = False) -> bool:
         now = time.monotonic()
@@ -241,15 +260,13 @@ class HCContinuousScraper:
                     self._bench_cache[state_code] = benches
                 if not benches:
                     logger.warning("No benches for %s. Skipping.", state_code)
-                    prog["state_idx"] += 1
-                    prog["bench_idx"] = 0
+                    self._advance_state(prog)
                     self._save_progress(prog)
                     continue
 
                 b_idx = prog.get("bench_idx", 0)
                 if b_idx >= len(benches):
-                    prog["state_idx"] += 1
-                    prog["bench_idx"] = 0
+                    self._advance_state(prog)
                     self._save_progress(prog)
                     continue
 
@@ -269,25 +286,27 @@ class HCContinuousScraper:
                     bench["bench_name"],
                 )
                 if not case_types:
-                    prog["bench_idx"] += 1
-                    prog["case_type_idx"] = 0
+                    self._advance_bench(prog)
                     self._save_progress(prog)
                     continue
 
                 ct_idx = prog.get("case_type_idx", 0)
                 if ct_idx >= len(case_types):
-                    prog["bench_idx"] += 1
-                    prog["case_type_idx"] = 0
+                    self._advance_bench(prog)
                     self._save_progress(prog)
                     continue
 
                 ct = case_types[ct_idx]
                 case_type_code = ct["type_code"]
 
-                yr = prog.get("year", HC_END_YEAR)
-                if yr < HC_START_YEAR:
-                    prog["case_type_idx"] += 1
+                yr = int(prog.get("year", HC_END_YEAR) or HC_END_YEAR)
+                if yr > HC_END_YEAR:
                     prog["year"] = HC_END_YEAR
+                    prog["status_idx"] = 0
+                    self._save_progress(prog)
+                    continue
+                if yr < HC_START_YEAR:
+                    self._advance_case_type(prog)
                     self._save_progress(prog)
                     continue
 

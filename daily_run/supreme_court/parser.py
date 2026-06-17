@@ -100,7 +100,7 @@ def _clean_parties(raw_html: str) -> str:
     if not raw_html:
         return ""
 
-    soup = BeautifulSoup(raw_html, "html.parser")
+    soup = BeautifulSoup(raw_html, "lxml")
     raw_text = soup.get_text(separator="|", strip=True)
     lines = [line.strip() for line in raw_text.split("|") if line.strip()]
 
@@ -140,7 +140,7 @@ def _parse_date_obj(date_str: str) -> dict | None:
     return None
 
 def _parse_main_tab(html: str) -> dict[str, dict]:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     details: dict[str, dict] = {}
 
     for tr in soup.find_all("tr"):
@@ -250,7 +250,7 @@ def build_sc_row(
             )
 
     if not row.get("nextListingDate") and html_listing:
-        soup_listing = BeautifulSoup(html_listing, "html.parser")
+        soup_listing = BeautifulSoup(html_listing, "lxml")
         for tr in soup_listing.find_all("tr"):
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) >= 1 and tds[0] and "CL Date" not in tds[0]:
@@ -261,7 +261,7 @@ def build_sc_row(
 
     history: list[dict] = []
     if html_judgements:
-        soup_j = BeautifulSoup(html_judgements, "html.parser")
+        soup_j = BeautifulSoup(html_judgements, "lxml")
         for tr in soup_j.find_all("tr"):
             tds = tr.find_all("td")
             if not tds:
@@ -289,7 +289,7 @@ def build_sc_row(
 
     apps: list[dict] = []
     if html_applications:
-        soup_app = BeautifulSoup(html_applications, "html.parser")
+        soup_app = BeautifulSoup(html_applications, "lxml")
         for tr in soup_app.find_all("tr"):
             tds = [td for td in tr.find_all("td")]
             if len(tds) < 6:

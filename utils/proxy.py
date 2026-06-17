@@ -34,7 +34,11 @@ class _ProxyEntry:
 
 
 class ProxyRotator:
-    """Thread-safe round-robin proxy pool with auto-banning and stats."""
+    """Thread-safe proxy pool with success-weighted selection and auto-banning."""
+
+    # How many candidates to sample before weighting (power-of-k load balancing).
+    # Keeps selection cheap and well-spread even for very large proxy lists.
+    _SAMPLE_SIZE = 64
 
     def __init__(
         self,
@@ -50,7 +54,6 @@ class ProxyRotator:
         self._url_index: dict[str, int] = {
             e.url: i for i, e in enumerate(self._entries)
         }
-        self._index = 0
         logger.info("Loaded %d proxies from %s", len(self._entries), proxy_file)
 
     @staticmethod
@@ -96,34 +99,36 @@ class ProxyRotator:
         return None
 
     async def get_proxy(self) -> str | None:
-        """Return next usable proxy URL, skipping banned proxies."""
+        """Return a usable proxy URL, favouring ones with a better success rate.
+
+        Picks via "power-of-k": sample a handful of healthy proxies, then choose
+        one with probability weighted by its success rate (with a small floor so
+        unproven proxies still get explored). This sends more traffic to
+        reliable IPs without overloading any single one, and stays cheap even
+        for very large pools.
+        """
         if not self._entries:
             return None
 
         async with self._lock:
             now = time.monotonic()
-            total = len(self._entries)
-            fallback: _ProxyEntry | None = None
+            usable = [e for e in self._entries if e.banned_until <= now]
+            if not usable:
+                # All banned — revive the one with the best historical record.
+                logger.warning("All proxies banned; unbanning best-performing one")
+                best = max(self._entries, key=lambda e: e.success_rate)
+                best.banned_until = 0.0
+                best.consecutive_failures = 0
+                return best.url
 
-            for _ in range(total):
-                entry = self._entries[self._index]
-                self._index = (self._index + 1) % total
-                if entry.banned_until > now:
-                    continue
-                if entry.consecutive_failures == 0:
-                    return entry.url
-                if fallback is None:
-                    fallback = entry
+            # Prefer proxies with no recent consecutive failures.
+            healthy = [e for e in usable if e.consecutive_failures == 0] or usable
 
-            if fallback is not None:
-                return fallback.url
-
-            # All banned — unban the one with highest historical success rate
-            logger.warning("All proxies banned; unbanning best-performing one")
-            best = max(self._entries, key=lambda e: e.success_rate)
-            best.banned_until = 0.0
-            best.consecutive_failures = 0
-            return best.url
+            k = min(len(healthy), self._SAMPLE_SIZE)
+            sample = random.sample(healthy, k) if k < len(healthy) else healthy
+            weights = [max(0.05, e.success_rate) for e in sample]
+            chosen = random.choices(sample, weights=weights, k=1)[0]
+            return chosen.url
 
     async def report_success(self, proxy_url: str) -> None:
         """Reset failure count and track success."""

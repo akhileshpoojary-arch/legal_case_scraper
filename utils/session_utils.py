@@ -14,9 +14,9 @@ import asyncio
 import logging
 import random
 import time
+from dataclasses import dataclass
 from typing import Any
 
-from utils.logging_utils import format_kv_block
 from utils.http_client import BaseHTTPClient, create_http_client
 from utils.proxy import ProxyRotator
 
@@ -33,6 +33,15 @@ _USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0",
 ]
+
+
+@dataclass(frozen=True)
+class RequestFailure:
+    """Structured request failure returned when a caller asks for error details."""
+
+    reason: str
+    message: str
+    label: str = ""
 
 
 class SessionManager:
@@ -87,20 +96,14 @@ class SessionManager:
             self._proxy_rotator.stats_summary() if self._proxy_rotator else "no proxy pool"
         )
         logger.warning(
-            format_kv_block(
-                f"[session:{self._name}] Rotation",
-                {
-                    "Session": {
-                        "rotation": self._rotation_count,
-                        "failures": self._consecutive_failures,
-                        "reason": self._last_failure_reason or "unknown",
-                    },
-                    "Proxy": {
-                        "current": self._proxy_label(self._current_proxy),
-                        "pool": proxy_summary,
-                    },
-                },
-            )
+            "[session:%s] rotated #%d after %d consecutive failures "
+            "reason=%s proxy=%s pool=%s",
+            self._name,
+            self._rotation_count,
+            self._consecutive_failures,
+            self._last_failure_reason or "unknown",
+            self._proxy_label(self._current_proxy),
+            proxy_summary,
         )
         if self._client:
             await self._client.close()
@@ -193,7 +196,8 @@ class SessionManager:
         json_data: dict[str, Any] | None = None,
         timeout: float = 20.0,
         label: str = "",
-    ) -> dict | list | None:
+        return_failure: bool = False,
+    ) -> dict | list | RequestFailure | None:
         """POST with semaphore, delay, and failure tracking."""
         async with self.semaphore:
             await asyncio.sleep(self._request_delay)
@@ -210,10 +214,17 @@ class SessionManager:
                 self._record_success()
                 return result
             except Exception as exc:
-                self._last_failure_reason = self._classify_exception(exc)
+                reason = self._classify_exception(exc)
+                self._last_failure_reason = reason
                 await self._record_failure()
                 if label:
                     logger.debug("%s → %s", label, exc)
+                if return_failure:
+                    return RequestFailure(
+                        reason=reason,
+                        message=str(exc),
+                        label=label,
+                    )
                 return None
 
     async def get(
@@ -223,7 +234,8 @@ class SessionManager:
         params: dict[str, str] | None = None,
         timeout: float = 20.0,
         label: str = "",
-    ) -> dict | list | None:
+        return_failure: bool = False,
+    ) -> dict | list | RequestFailure | None:
         """GET with semaphore, delay, and failure tracking."""
         async with self.semaphore:
             await asyncio.sleep(self._request_delay)
@@ -239,10 +251,17 @@ class SessionManager:
                 self._record_success()
                 return result
             except Exception as exc:
-                self._last_failure_reason = self._classify_exception(exc)
+                reason = self._classify_exception(exc)
+                self._last_failure_reason = reason
                 await self._record_failure()
                 if label:
                     logger.debug("%s → %s", label, exc)
+                if return_failure:
+                    return RequestFailure(
+                        reason=reason,
+                        message=str(exc),
+                        label=label,
+                    )
                 return None
 
     async def post_text(
@@ -253,7 +272,8 @@ class SessionManager:
         headers: dict[str, str] | None = None,
         timeout: float = 20.0,
         label: str = "",
-    ) -> str | None:
+        return_failure: bool = False,
+    ) -> str | RequestFailure | None:
         """POST returning raw text (for HTML/BOM responses)."""
         async with self.semaphore:
             await asyncio.sleep(self._request_delay)
@@ -269,10 +289,17 @@ class SessionManager:
                 self._record_success()
                 return result
             except Exception as exc:
-                self._last_failure_reason = self._classify_exception(exc)
+                reason = self._classify_exception(exc)
+                self._last_failure_reason = reason
                 await self._record_failure()
                 if label:
                     logger.debug("%s → %s", label, exc)
+                if return_failure:
+                    return RequestFailure(
+                        reason=reason,
+                        message=str(exc),
+                        label=label,
+                    )
                 return None
 
     async def get_text(
@@ -283,7 +310,8 @@ class SessionManager:
         headers: dict[str, str] | None = None,
         timeout: float = 20.0,
         label: str = "",
-    ) -> str | None:
+        return_failure: bool = False,
+    ) -> str | RequestFailure | None:
         """GET returning raw text."""
         async with self.semaphore:
             await asyncio.sleep(self._request_delay)
@@ -299,10 +327,17 @@ class SessionManager:
                 self._record_success()
                 return result
             except Exception as exc:
-                self._last_failure_reason = self._classify_exception(exc)
+                reason = self._classify_exception(exc)
+                self._last_failure_reason = reason
                 await self._record_failure()
                 if label:
                     logger.debug("%s → %s", label, exc)
+                if return_failure:
+                    return RequestFailure(
+                        reason=reason,
+                        message=str(exc),
+                        label=label,
+                    )
                 return None
 
     async def get_bytes(
@@ -312,7 +347,8 @@ class SessionManager:
         headers: dict[str, str] | None = None,
         timeout: float = 20.0,
         label: str = "",
-    ) -> bytes | None:
+        return_failure: bool = False,
+    ) -> bytes | RequestFailure | None:
         """GET returning raw bytes (captcha images, binary downloads)."""
         async with self.semaphore:
             await asyncio.sleep(self._request_delay)
@@ -327,10 +363,17 @@ class SessionManager:
                 self._record_success()
                 return result
             except Exception as exc:
-                self._last_failure_reason = self._classify_exception(exc)
+                reason = self._classify_exception(exc)
+                self._last_failure_reason = reason
                 await self._record_failure()
                 if label:
                     logger.debug("%s → %s", label, exc)
+                if return_failure:
+                    return RequestFailure(
+                        reason=reason,
+                        message=str(exc),
+                        label=label,
+                    )
                 return None
 
     def update_cookies(self, new_cookies: dict[str, str]) -> None:

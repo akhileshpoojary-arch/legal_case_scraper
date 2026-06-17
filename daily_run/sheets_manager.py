@@ -7,11 +7,11 @@ import logging
 import random
 import re
 import time
-from pathlib import Path
 from typing import Any
 
 from config import SERVICE_ACCOUNT_FILE
 from utils.sheet_dedup import row_dedup_key
+from daily_run.case_index import CaseIndex
 from daily_run.cluster import (
     acquire_write_lock,
     ensure_config_worksheet_sync,
@@ -93,8 +93,9 @@ class DailyRunSheetsManager:
         self._header_cache: dict[str, list[str]] = {}
         self._case_col_cache: dict[str, int | None] = {}
         self._existing_case_cache: dict[str, set[str]] = {}
-        # All dedup keys across every paginated file for a court (DC / HC / SC).
-        self._court_wide_dedup: dict[str, set[str]] = {}
+        # Local SQLite index: the de-duplication source of truth and the
+        # zero-quota backend for on-demand search (see daily_run/case_index.py).
+        self._index = CaseIndex.get_or_create()
         self._shared_ok_cache: set[str] = set()
         # Cache active sheet ID and row counts to avoid redundant API reads
         self._active_sheet_info: dict[str, dict[str, Any]] = {}
@@ -438,84 +439,16 @@ class DailyRunSheetsManager:
             logger.warning("Primary-row scan failed for sheet %s: %s", sheet_id, e)
             return groups
 
-    def _dedup_keys_from_sheet_rows(self, sheet_id: str) -> set[str]:
+    def _invalidate_after_write_error(self, court_type: str) -> None:
         """
-        Build row_dedup_key for every data row (cross-tab dedup).
+        Drop the cached write position after an ambiguous append failure.
 
-        Reads only the columns needed for row_dedup_key in one batch_get
-        instead of get_all_values() (same quota weight per sheet, far less
-        payload than full grid when many columns exist).
+        A failed Sheets append may have written zero rows or some rows before the
+        client observed the error. Reloading live state on retry prevents stale
+        row-count rotation decisions. De-dup state lives in the SQLite index
+        (durable and idempotent), so it needs no invalidation here.
         """
-        keys: set[str] = set()
-        try:
-            for group in self._primary_row_groups_from_sheet(sheet_id):
-                k = str(group.get("dedup_key", "")).strip()
-                if k:
-                    keys.add(k)
-            return keys
-        except Exception as e:
-            logger.warning("Dedup scan failed for sheet %s: %s", sheet_id, e)
-            return keys
-
-    def _load_court_wide_dedup(self, court_type: str) -> set[str]:
-        ids = self._get_sheet_ids_for_court(court_type)
-        acc: set[str] = set()
-        for sid in ids:
-            acc |= self._dedup_keys_from_sheet_rows(sid)
-        logger.info(
-            "[%s] Court-wide dedup: %d keys from %d spreadsheet(s).",
-            court_type.upper(),
-            len(acc),
-            len(ids),
-        )
-        return acc
-
-    def _get_cache_path(self, court_type: str) -> Path:
-        from daily_run.config import _pdir
-        cache_dir = _pdir / ".dedup_cache"
-        try:
-            cache_dir.mkdir(exist_ok=True)
-        except Exception:
-            pass
-        return cache_dir / f"{court_type}_keys.txt"
-
-    def _load_local_dedup_cache(self, court_type: str) -> set[str]:
-        path = self._get_cache_path(court_type)
-        if not path.exists():
-            return set()
-        try:
-            with open(path, "r") as f:
-                return {line.strip() for line in f if line.strip()}
-        except Exception as e:
-            logger.debug("Failed to load dedup cache for %s: %s", court_type, e)
-            return set()
-
-    def _save_local_dedup_cache(self, court_type: str, keys: set[str]):
-        path = self._get_cache_path(court_type)
-        try:
-            with open(path, "w") as f:
-                for k in sorted(keys):
-                    f.write(f"{k}\n")
-        except Exception as e:
-            logger.warning("Could not save dedup cache: %s", e)
-
-    def _ensure_court_wide_dedup(self, court_type: str) -> set[str]:
-        if court_type not in self._court_wide_dedup:
-            # Stagger startup reads to avoid simultaneous 429s from parallel scrapers
-            time.sleep(random.uniform(0.1, 8.0))
-
-            cached = self._load_local_dedup_cache(court_type)
-            live = self._load_court_wide_dedup(court_type)
-            if cached:
-                logger.info(
-                    "[%s] Initialized %d keys from local dedup cache.",
-                    court_type.upper(),
-                    len(cached),
-                )
-            merged = set(cached) | set(live)
-            self._court_wide_dedup[court_type] = merged
-            self._save_local_dedup_cache(court_type, merged)
-        return self._court_wide_dedup[court_type]
+        self._active_sheet_info.pop(court_type, None)
 
     def find_duplicate_groups(self, court_type: str) -> dict[str, Any]:
         """Audit duplicate logical rows across all paginated sheets for a court."""
@@ -594,9 +527,7 @@ class DailyRunSheetsManager:
                 self._header_cache.pop(sid, None)
                 self._case_col_cache.pop(sid, None)
 
-            self._court_wide_dedup.pop(court_type, None)
             self._active_sheet_info.pop(court_type, None)
-            self._save_local_dedup_cache(court_type, self._load_court_wide_dedup(court_type))
 
         return {
             **audit,
@@ -720,16 +651,19 @@ class DailyRunSheetsManager:
                     ws0.append_row(header)
                 self._header_cache[active_id] = header
 
-                existing = self._ensure_court_wide_dedup(court_type)
+                # De-dup against the local SQLite index (one fast local query)
+                # plus within this batch. No live Sheets reads needed.
+                all_keys = [row_dedup_key(c) for c in cases]
+                existing = self._index.existing_keys(court_type, all_keys)
                 new_cases: list[dict[str, Any]] = []
                 dup_keys: list[str] = []
-                for case in cases:
-                    k = row_dedup_key(case)
-                    if k in existing:
+                new_keys: set[str] = set()
+                for case, k in zip(cases, all_keys):
+                    if k in existing or k in new_keys:
                         dup_keys.append(k)
                         continue
                     new_cases.append(case)
-                    existing.add(k)
+                    new_keys.add(k)
 
                 if dup_keys:
                     logger.info(
@@ -820,7 +754,9 @@ class DailyRunSheetsManager:
                     time.monotonic() - started,
                     len(cases),
                 )
-                self._save_local_dedup_cache(court_type, existing)
+                # Record what was just written so future runs de-dup against it
+                # and on-demand search can find it without touching Sheets.
+                self._index.add_cases(court_type, new_cases, active_id)
                 return len(new_cases)
 
             attempt = 0
@@ -829,6 +765,7 @@ class DailyRunSheetsManager:
                 try:
                     return await run_writes()
                 except gspread.exceptions.APIError as e:
+                    self._invalidate_after_write_error(court_type)
                     if not self._is_retryable_error(e):
                         logger.error(
                             "[%s] Non-retryable write API error: %s",
@@ -850,6 +787,7 @@ class DailyRunSheetsManager:
                     )
                     await asyncio.sleep(delay)
                 except Exception as e:
+                    self._invalidate_after_write_error(court_type)
                     if not self._is_retryable_error(e):
                         logger.error(
                             "[%s] Non-retryable write error: %s",

@@ -110,6 +110,46 @@ async def solve_async_with_metadata(
     )
 
 
+def solve_with_confidence(
+    image_bytes: bytes,
+    expected_length: int = 6,
+    prefix: str = "hc",
+) -> tuple[str, str, float]:
+    """Solve and return ``(answer, solver_name, confidence)``.
+
+    ``confidence`` (0–1) lets callers skip submitting a likely-wrong guess and
+    re-fetch a fresh captcha instead (see ``CAPTCHA_MIN_CONFIDENCE``).
+    """
+    from utils.captcha_ensemble import get_ensemble_solver
+
+    try:
+        solver = get_ensemble_solver()
+        if prefix == "sci":
+            prediction = solver.predict_type2_with_source(image_bytes)
+        else:
+            prediction = solver.predict_type1_with_source(image_bytes)
+        return prediction.answer, prediction.solver, prediction.confidence
+    except Exception as exc:
+        logger.warning("CAPTCHA solve failed (ensemble): %s", exc)
+        return "", "none", 0.0
+
+
+async def solve_async_with_confidence(
+    image_bytes: bytes,
+    expected_length: int = 6,
+    prefix: str = "hc",
+) -> tuple[str, str, float]:
+    """Async wrapper returning ``(answer, solver_name, confidence)``."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _CAPTCHA_EXECUTOR,
+        solve_with_confidence,
+        image_bytes,
+        expected_length,
+        prefix,
+    )
+
+
 def record_captcha_feedback(
     prefix: str,
     accepted: bool,

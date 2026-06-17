@@ -49,8 +49,14 @@ SCI_YEAR_TO = datetime.today().year
 # ═══════════════════════════════════════════════════════════════
 #  SCRAPER-SPECIFIC DATE RANGES
 # ═══════════════════════════════════════════════════════════════
+NCLT_FIRST_YEAR = 2016
 NCLT_YEAR_FROM = 2007
 NCLT_YEAR_TO = datetime.today().year
+NCLT_SEARCH_CONCURRENCY = int(os.environ.get("NCLT_SEARCH_CONCURRENCY", "6"))
+NCLT_DETAIL_CONCURRENCY = int(os.environ.get("NCLT_DETAIL_CONCURRENCY", "8"))
+NCLT_SEARCH_TIMEOUT = float(os.environ.get("NCLT_SEARCH_TIMEOUT", "45"))
+NCLT_DETAIL_TIMEOUT = float(os.environ.get("NCLT_DETAIL_TIMEOUT", "60"))
+NCLT_HEALTHCHECK_TIMEOUT = float(os.environ.get("NCLT_HEALTHCHECK_TIMEOUT", "15"))
 
 HC_YEAR_FROM = 2025
 HC_YEAR_TO = datetime.today().year
@@ -78,7 +84,7 @@ SCRAPER_RESULT_CELLS: dict[str, str] = {
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  CONCURRENCY  (env-driven for Railway auto-scaling)
+#  CONCURRENCY  (env-driven)
 # ═══════════════════════════════════════════════════════════════
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 20))
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "0.03"))
@@ -111,7 +117,7 @@ MAX_PROXY_FAILURES = 10
 DC_PARALLEL_WORKERS = MAX_CONCURRENT
 
 # ═══════════════════════════════════════════════════════════════
-#  GOOGLE SHEETS  (env var SERVICE_ACCOUNT_JSON for Railway)
+#  GOOGLE SHEETS  (env var SERVICE_ACCOUNT_JSON or local file)
 # ═══════════════════════════════════════════════════════════════
 def _resolve_service_account() -> Path:
     """Load from SERVICE_ACCOUNT_JSON env var or fall back to local file."""

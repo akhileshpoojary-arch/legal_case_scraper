@@ -58,6 +58,7 @@ async def run_scrapers_for_party(
         start_time = datetime.now()
         scraper = scraper_cls()
         source = scraper.SOURCE
+        logger.info("Starting %s scraper for party=%s", source, party_name)
         if sheets and row_num > 0:
             try:
                 status_label = f"RUNNING"
@@ -68,11 +69,12 @@ async def run_scrapers_for_party(
         try:
             rows = await scraper.run(party_name)
             end_time = datetime.now()
+            elapsed = int((end_time - start_time).total_seconds())
             if rows:
                 primary_count = sum(1 for r in rows if not r.get("_is_continuation"))
-                logger.info("    ✅ %s: %d cases", source, primary_count)
+                logger.info("%s complete: cases=%d elapsed=%ds", source, primary_count, elapsed)
             else:
-                logger.info("    ⚠  %s: no data", source)
+                logger.info("%s complete: no cases elapsed=%ds", source, elapsed)
                 rows = []
             return source, rows, scraper_cls, start_time, end_time
         except Exception as exc:

@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
-from pathlib import Path
 from typing import Any
 
 from config import (
@@ -20,6 +18,8 @@ from daily_run.config import (
     CONFIG_WORKSHEET_NAME,
     DETAIL_SESSION_POOL_SIZE,
     SC_END_YEAR,
+    SC_EMPTY_JUMP_ENABLED,
+    SC_MAX_CAPTCHA_EXHAUSTIONS_PER_CASE,
     SC_MAX_CONSECUTIVE_FAILURES,
     SC_PROGRESS_FILE,
     SC_SEARCH_WORKERS,
@@ -27,6 +27,8 @@ from daily_run.config import (
     SC_START_YEAR,
     SYSTEM_SHARD_ID,
     WORKER_LABEL,
+    load_progress_safe,
+    save_progress_atomic,
 )
 from daily_run.supreme_court.extractor import SCI_CASE_TYPES, SCIContinuousExtractor
 from daily_run.supreme_court.parser import build_sc_row
@@ -48,6 +50,8 @@ logger = logging.getLogger("legal_scraper.daily_run.sc.scraper")
 
 def _sc_empty_jump(consecutive_empty: int) -> int:
     """Adaptive case_no jump to skip long empty ranges faster."""
+    if not SC_EMPTY_JUMP_ENABLED:
+        return 1
     if consecutive_empty <= 10:
         return 1
     if consecutive_empty <= 20:
@@ -149,15 +153,10 @@ class SCContinuousScraper:
             await sm.close()
 
     def _load_progress(self) -> dict:
-        p = Path(SC_PROGRESS_FILE)
-        if p.exists():
-            with p.open() as f:
-                return json.load(f)
-        return self._default_progress()
+        return load_progress_safe(SC_PROGRESS_FILE, self._default_progress())
 
     def _save_progress(self, prog: dict) -> None:
-        with open(SC_PROGRESS_FILE, "w") as f:
-            json.dump(prog, f, indent=4)
+        save_progress_atomic(SC_PROGRESS_FILE, prog)
 
     def _refresh_case_type_slice(self, *, force: bool = False) -> bool:
         now = time.monotonic()
@@ -204,6 +203,7 @@ class SCContinuousScraper:
                             "last": last,
                             "search_workers": len(self._search_extractors),
                             "detail_sessions": len(self._detail_sessions),
+                            "empty_jump_enabled": SC_EMPTY_JUMP_ENABLED,
                         },
                     },
                 )
@@ -268,7 +268,12 @@ class SCContinuousScraper:
                 ct_name = ct["name"]
                 prog["case_type_code"] = ct_code
 
-                year = prog.get("year", SC_END_YEAR)
+                year = int(prog.get("year", SC_END_YEAR) or SC_END_YEAR)
+                if year > SC_END_YEAR:
+                    prog["year"] = SC_END_YEAR
+                    prog["case_no"] = 1
+                    self._save_progress(prog)
+                    continue
                 if year < SC_START_YEAR:
                     prog["case_type_idx"] += 1
                     prog["year"] = SC_END_YEAR
@@ -276,7 +281,7 @@ class SCContinuousScraper:
                     self._save_progress(prog)
                     continue
 
-                case_no_start = prog.get("case_no", 1)
+                case_no_start = max(1, int(prog.get("case_no", 1) or 1))
                 total_case_types = len(case_types)
                 years_progress = descending_year_progress(
                     year, SC_START_YEAR, SC_END_YEAR
@@ -313,6 +318,9 @@ class SCContinuousScraper:
                 detail_failure_total = 0
                 written_total = 0
                 telemetry_every = max(100, worker_count * 25)
+                abort_search = asyncio.Event()
+                abort_reason: str | None = None
+                earliest_unresolved_case_no: int | None = None
 
                 async def build_case_row(
                     case_result: dict[str, Any],
@@ -381,72 +389,131 @@ class SCContinuousScraper:
                     worker_idx: int,
                     extractor: SCIContinuousExtractor,
                 ) -> None:
-                    nonlocal max_searched_case_no
+                    nonlocal abort_reason, earliest_unresolved_case_no, max_searched_case_no
                     case_no = case_no_start + worker_idx
                     consecutive_empty = 0
                     search_stride = worker_count
+                    captcha_exhaustions_for_case = 0
+                    retryable_errors_for_case = 0
+                    retryable_cutoff = max(5, SC_MAX_CAPTCHA_EXHAUSTIONS_PER_CASE * 2)
 
                     scid: str | None = None
                     tok_name: str | None = None
                     tok_value: str | None = None
 
-                    while consecutive_empty < SC_MAX_CONSECUTIVE_FAILURES:
-                        if not scid or not tok_name or not tok_value:
-                            scid, tok_name, tok_value = await extractor.get_base_tokens()
-                            if not scid or not tok_name:
-                                await asyncio.sleep(1.0)
+                    async def abort_block(reason: str) -> None:
+                        nonlocal abort_reason, earliest_unresolved_case_no
+                        async with max_case_lock:
+                            if (
+                                earliest_unresolved_case_no is None
+                                or case_no < earliest_unresolved_case_no
+                            ):
+                                earliest_unresolved_case_no = case_no
+                            if abort_reason is None:
+                                abort_reason = reason
+                            abort_search.set()
+
+                    try:
+                        while (
+                            not abort_search.is_set()
+                            and consecutive_empty < SC_MAX_CONSECUTIVE_FAILURES
+                        ):
+                            if not scid or not tok_name or not tok_value:
+                                scid, tok_name, tok_value = await extractor.get_base_tokens()
+                                if not scid or not tok_name or not tok_value:
+                                    retryable_errors_for_case += 1
+                                    if retryable_errors_for_case >= retryable_cutoff:
+                                        await abort_block(
+                                            f"token_fetch_failed case_no={case_no}"
+                                        )
+                                        return
+                                    await asyncio.sleep(1.0)
+                                    continue
+
+                            result = await extractor.search_by_case_no(
+                                case_type=ct_code,
+                                case_no=case_no,
+                                year=year,
+                                scid=scid,
+                                tok_name=tok_name,
+                                tok_value=tok_value,
+                                search_label=target_label,
+                            )
+                            search_state = (
+                                result.get("_search_state")
+                                if isinstance(result, dict)
+                                else None
+                            )
+                            if search_state == "captcha_error":
+                                extractor.invalidate_tokens()
+                                scid = tok_name = tok_value = None
+                                captcha_exhaustions_for_case += 1
+                                if (
+                                    captcha_exhaustions_for_case
+                                    >= SC_MAX_CAPTCHA_EXHAUSTIONS_PER_CASE
+                                ):
+                                    logger.warning(
+                                        "[SC] CAPTCHA exhausted repeatedly: case_no=%d exhaustions=%d; retrying block without advancing past it.",
+                                        case_no,
+                                        captcha_exhaustions_for_case,
+                                    )
+                                    await abort_block(f"captcha_exhausted case_no={case_no}")
+                                    return
+                                logger.warning(
+                                    "[SC] CAPTCHA exhausted: case_no=%d exhaustion=%d/%d; retrying same case number.",
+                                    case_no,
+                                    captcha_exhaustions_for_case,
+                                    SC_MAX_CAPTCHA_EXHAUSTIONS_PER_CASE,
+                                )
+                                await asyncio.sleep(
+                                    min(1.0 * captcha_exhaustions_for_case, 5.0)
+                                )
+                                continue
+                            if search_state == "retryable_error":
+                                extractor.invalidate_tokens()
+                                scid = tok_name = tok_value = None
+                                retryable_errors_for_case += 1
+                                if retryable_errors_for_case >= retryable_cutoff:
+                                    await abort_block(
+                                        f"retryable_error case_no={case_no}"
+                                    )
+                                    return
+                                await asyncio.sleep(
+                                    min(0.5 * retryable_errors_for_case, 5.0)
+                                )
                                 continue
 
-                        result = await extractor.search_by_case_no(
-                            case_type=ct_code,
-                            case_no=case_no,
-                            year=year,
-                            scid=scid,
-                            tok_name=tok_name,
-                            tok_value=tok_value,
-                            search_label=target_label,
-                        )
-                        search_state = (
-                            result.get("_search_state")
-                            if isinstance(result, dict)
-                            else None
-                        )
-                        if search_state == "captcha_error":
-                            extractor.invalidate_tokens()
-                            scid = tok_name = tok_value = None
-                            logger.warning(
-                                "[SC] Skipping case_no=%d after CAPTCHA exhaustion",
-                                case_no,
-                            )
-                            consecutive_empty += 1
+                            captcha_exhaustions_for_case = 0
+                            retryable_errors_for_case = 0
+
+                            async with max_case_lock:
+                                if case_no > max_searched_case_no:
+                                    max_searched_case_no = case_no
+
+                            if result is None:
+                                consecutive_empty += 1
+                                jump = _sc_empty_jump(consecutive_empty)
+                                case_no += search_stride * max(1, jump)
+                                if consecutive_empty % 100 == 0:
+                                    scid = tok_name = tok_value = None
+                                continue
+
+                            consecutive_empty = 0
+                            await result_queue.put((result, case_no))
                             case_no += search_stride
-                            await asyncio.sleep(0.25)
-                            continue
-                        if search_state == "retryable_error":
-                            extractor.invalidate_tokens()
-                            scid = tok_name = tok_value = None
-                            await asyncio.sleep(0.25)
-                            continue
-
-                        async with max_case_lock:
-                            if case_no > max_searched_case_no:
-                                max_searched_case_no = case_no
-
-                        if result is None:
-                            consecutive_empty += 1
-                            jump = _sc_empty_jump(consecutive_empty)
-                            case_no += max(search_stride, jump)
-                            if consecutive_empty % 100 == 0:
+                            if case_no % 200 == 0:
                                 scid = tok_name = tok_value = None
-                            continue
-
-                        consecutive_empty = 0
-                        await result_queue.put((result, case_no))
-                        case_no += search_stride
-                        if case_no % 200 == 0:
-                            scid = tok_name = tok_value = None
-
-                    await result_queue.put(None)
+                    except Exception as exc:
+                        logger.exception(
+                            "[SC] Search worker failed: worker_idx=%d case_no=%d",
+                            worker_idx,
+                            case_no,
+                        )
+                        await abort_block(
+                            f"worker_exception {exc.__class__.__name__} case_no={case_no}"
+                        )
+                    finally:
+                        await result_queue.put(None)
 
                 worker_tasks = [
                     asyncio.create_task(sc_search_worker(idx, ex))
@@ -575,6 +642,23 @@ class SCContinuousScraper:
                     format_duration(search_elapsed),
                 )
 
+                if abort_reason:
+                    next_case_no = max(
+                        1,
+                        int(earliest_unresolved_case_no or case_no_start),
+                    )
+                    prog["case_no"] = next_case_no
+                    self._save_progress(prog)
+                    logger.warning(
+                        "[SC] Block retry scheduled: worker=%s target={%s} reason=%s next_case_no=%d session_written=%d",
+                        WORKER_LABEL,
+                        target_label,
+                        abort_reason,
+                        next_case_no,
+                        self._session_written_total,
+                    )
+                    await asyncio.sleep(5)
+                    continue
 
                 logger.info(
                     "[SC] Block complete: worker=%s target={%s} exhausted_at_case_no=%d empty_cutoff=%d next_year=%d next_case_no=%d session_written=%d",

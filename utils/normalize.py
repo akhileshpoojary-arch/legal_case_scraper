@@ -5,9 +5,27 @@ from __future__ import annotations
 import html
 import logging
 import re
+import unicodedata
 from typing import Any
 
 logger = logging.getLogger("legal_scraper.normalize")
+
+_ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\ufeff]")  # zero-width / BOM
+
+
+def _fold_unicode(text: str) -> str:
+    """Fold accents/diacritics to ASCII and drop zero-width characters.
+
+    So 'JOSÉ D'SOUZA' and 'JOSE D'SOUZA' normalize to the same name. The FTS
+    index tokenizer already folds accents; doing it here keeps the exact-match
+    filter (utils/name_filter) consistent with what the index returns.
+    """
+    if not text:
+        return ""
+    text = _ZERO_WIDTH_RE.sub("", text)
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
 
 _DISPOSED_KEYWORDS = frozenset({
     "disposed", "disposed off", "disposed off/compliance",
@@ -136,6 +154,7 @@ def normalize_party_name(name: str | None) -> str:
 
     text = html.unescape(text)
     text = text.replace("&AMP;", "&").replace("&amp;", "&")
+    text = _fold_unicode(text)
 
     text = re.sub(r"\(Not Applicable\)", "", text, flags=re.IGNORECASE)
 

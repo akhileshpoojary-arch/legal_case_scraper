@@ -1,0 +1,25 @@
+# Keep the Docker image small and the build fast.
+# Runtime data is bind-mounted by docker-compose, so it need not be in the image.
+
+# Python caches / local virtualenvs
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.ruff_cache/
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+.git/
+.gitignore
+
+# Generated at runtime (recreated automatically; provided via the bind mount)
+data/
+.dedup_cache/
+captcha_img/
+
+# Secret — provide it in the project folder; docker-compose mounts it at runtime
+service_account.json

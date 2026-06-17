@@ -1,0 +1,37 @@
+# One-click self-hosting for the legal case scraper.
+#
+#   docker compose up -d            # start both services in the background
+#   docker compose logs -f collector   # watch the 24/7 collector
+#   docker compose logs -f search      # watch on-demand search
+#   docker compose down            # stop everything
+#
+# Both services bind-mount the project directory, so the SQLite index, resume
+# progress files, captcha stats, proxy list and service_account.json all live on
+# the host and survive container restarts and rebuilds. Put service_account.json
+# and "Webshare proxies.txt" in this folder before starting.
+
+services:
+  # The 24/7 collector: scrapes DC/HC/SC and writes to Sheets + the local index.
+  collector:
+    build: .
+    image: legal-case-scraper:latest
+    command: python run_all.py
+    restart: unless-stopped
+    init: true
+    volumes:
+      - ./:/app
+    environment:
+      - SYSTEM_SHARD_ID=1
+      # Tune for your machine; see README "Useful Environment Variables".
+
+  # On-demand party search. Reads names from the "Search Console" sheet and
+  # answers them from the local index (zero Google Sheets reads for DC/HC/SC).
+  search:
+    image: legal-case-scraper:latest
+    command: python main.py
+    restart: unless-stopped
+    init: true
+    depends_on:
+      - collector
+    volumes:
+      - ./:/app

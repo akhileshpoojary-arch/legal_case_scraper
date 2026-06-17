@@ -7,22 +7,36 @@ Tracks per-solver accuracy at runtime to auto-weight decisions.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("legal_scraper.captcha_ensemble")
 
+# Per-solver accuracy is persisted here so the ensemble's learned weighting
+# survives the frequent restarts of a 24/7 service (otherwise it relearns from
+# scratch every launch). sqlite-style data/ dir; created automatically.
+_STATS_PATH = Path(__file__).resolve().parent.parent / "data" / "captcha_stats.json"
+_STATS_SAVE_INTERVAL_SECONDS = 30.0
+
 
 @dataclass(frozen=True, slots=True)
 class CaptchaPrediction:
-    """A captcha answer plus the solver source used for runtime feedback."""
+    """A captcha answer, the solver source (for feedback), and a 0–1 confidence.
+
+    ``confidence`` lets callers optionally skip submitting a likely-wrong guess
+    (see ``CAPTCHA_MIN_CONFIDENCE``) and re-fetch a fresh captcha instead.
+    """
 
     answer: str
     solver: str
+    confidence: float = 0.5
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -64,6 +78,15 @@ class _AccuracyTracker:
             if accepted:
                 self._accepted += 1
 
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {"total": self._total, "accepted": self._accepted}
+
+    def restore(self, total: int, accepted: int) -> None:
+        with self._lock:
+            self._total = max(0, int(total))
+            self._accepted = max(0, int(accepted))
+
     @property
     def accuracy(self) -> float:
         with self._lock:
@@ -102,9 +125,47 @@ class EnsembleSolver:
         self.keras_t2_tracker = _AccuracyTracker("keras_t2")
         self.ddddocr_t1_tracker = _AccuracyTracker("ddddocr_t1")
         self.ddddocr_t2_tracker = _AccuracyTracker("ddddocr_t2")
+        self._stats_lock = threading.Lock()
+        self._stats_last_saved = 0.0
+        self._load_stats()
 
         self._init_keras()
         self._init_ddddocr()
+
+    def _trackers(self) -> dict[str, _AccuracyTracker]:
+        return {
+            "keras_t1": self.keras_t1_tracker,
+            "keras_t2": self.keras_t2_tracker,
+            "ddddocr_t1": self.ddddocr_t1_tracker,
+            "ddddocr_t2": self.ddddocr_t2_tracker,
+        }
+
+    def _load_stats(self) -> None:
+        """Restore persisted per-solver accuracy from a previous run."""
+        try:
+            data = json.loads(_STATS_PATH.read_text())
+        except Exception:
+            return
+        for name, tracker in self._trackers().items():
+            saved = data.get(name) or {}
+            tracker.restore(saved.get("total", 0), saved.get("accepted", 0))
+        logger.info("Restored captcha accuracy stats from %s", _STATS_PATH)
+
+    def _save_stats(self, force: bool = False) -> None:
+        """Persist accuracy stats, throttled to avoid frequent disk writes."""
+        now = time.monotonic()
+        with self._stats_lock:
+            if not force and now - self._stats_last_saved < _STATS_SAVE_INTERVAL_SECONDS:
+                return
+            self._stats_last_saved = now
+            data = {name: t.snapshot() for name, t in self._trackers().items()}
+            try:
+                _STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                tmp = _STATS_PATH.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data, indent=2))
+                os.replace(tmp, _STATS_PATH)
+            except Exception as exc:
+                logger.debug("Could not save captcha stats: %s", exc)
 
     def _init_keras(self) -> None:
         """Load the existing Keras/ONNX model solver."""
@@ -195,11 +256,16 @@ class EnsembleSolver:
             if not ddddocr_result:
                 ddddocr_result = self._ddddocr_predict_t1(image_bytes)
 
-        answer, solver = self._pick_best_t1(keras_result, ddddocr_result)
-        return CaptchaPrediction(answer=answer, solver=solver)
+        answer, solver, confidence = self._pick_best_t1(keras_result, ddddocr_result)
+        return CaptchaPrediction(answer=answer, solver=solver, confidence=confidence)
 
-    def _pick_best_t1(self, keras: str, ddddocr: str) -> tuple[str, str]:
-        """Pick the best Type 1 prediction based on runtime accuracy."""
+    def _pick_best_t1(self, keras: str, ddddocr: str) -> tuple[str, str, float]:
+        """Pick the best Type 1 prediction and a 0–1 confidence.
+
+        No native confidence exists for the CTC text model, so solver
+        *agreement* is used as the proxy: both agree → high, single → medium,
+        disagreement → low (the answer may still be right, but it is riskier).
+        """
         if keras and not re.fullmatch(r"[a-z0-9]{6}", keras):
             keras = ""
         if ddddocr and not re.fullmatch(r"[a-z0-9]{6}", ddddocr):
@@ -207,17 +273,17 @@ class EnsembleSolver:
 
         # Both empty — nothing to do
         if not keras and not ddddocr:
-            return "", "none"
+            return "", "none", 0.0
 
         # Only one produced a result
         if not keras:
-            return ddddocr, "ddddocr"
+            return ddddocr, "ddddocr", 0.6
         if not ddddocr:
-            return keras, "keras"
+            return keras, "keras", 0.6
 
         # Both agree
         if keras == ddddocr:
-            return keras, "both"
+            return keras, "both", 0.95
 
         # Both disagree — pick based on runtime accuracy tracking
         keras_acc = self.keras_t1_tracker.accuracy
@@ -226,12 +292,12 @@ class EnsembleSolver:
         # Need minimum 10 samples before trusting accuracy data
         if self.keras_t1_tracker.total < 10 and self.ddddocr_t1_tracker.total < 10:
             # No data yet — prefer keras (domain-trained)
-            return keras, "keras"
+            return keras, "keras", 0.4
 
         # Prefer the solver with higher accuracy, with a small bias toward keras
         if keras_acc >= ddddocr_acc:
-            return keras, "keras"
-        return ddddocr, "ddddocr"
+            return keras, "keras", max(0.4, keras_acc)
+        return ddddocr, "ddddocr", max(0.4, ddddocr_acc)
 
     # ── Type 2: SC math captcha ───────────────────────────────
 
@@ -315,39 +381,41 @@ class EnsembleSolver:
             if not ddddocr_answer:
                 ddddocr_answer = self._ddddocr_predict_t2(image_bytes)
 
-        answer, solver = self._pick_best_t2(keras_answer, keras_conf, ddddocr_answer)
-        return CaptchaPrediction(answer=answer, solver=solver)
+        answer, solver, confidence = self._pick_best_t2(
+            keras_answer, keras_conf, ddddocr_answer
+        )
+        return CaptchaPrediction(answer=answer, solver=solver, confidence=confidence)
 
     def _pick_best_t2(
         self,
         keras: str,
         keras_conf: float,
         ddddocr: str,
-    ) -> tuple[str, str]:
-        """Pick the best Type 2 prediction."""
+    ) -> tuple[str, str, float]:
+        """Pick the best Type 2 prediction and a 0–1 confidence."""
         if not keras and not ddddocr:
-            return "", "none"
+            return "", "none", 0.0
         if not keras:
-            return ddddocr, "ddddocr"
+            return ddddocr, "ddddocr", 0.6
         if not ddddocr:
-            return keras, "keras"
+            return keras, "keras", 0.6
         if keras == ddddocr:
-            return keras, "both"
+            return keras, "both", 0.95
 
         # High-confidence Keras prediction wins
         if keras_conf >= 0.7:
-            return keras, "keras"
+            return keras, "keras", keras_conf
 
         # Low confidence — use runtime accuracy tracking
         keras_acc = self.keras_t2_tracker.accuracy
         ddddocr_acc = self.ddddocr_t2_tracker.accuracy
 
         if self.keras_t2_tracker.total < 10 and self.ddddocr_t2_tracker.total < 10:
-            return keras, "keras"  # no data, prefer domain-trained
+            return keras, "keras", 0.4  # no data, prefer domain-trained
 
         if keras_acc >= ddddocr_acc:
-            return keras, "keras"
-        return ddddocr, "ddddocr"
+            return keras, "keras", max(0.4, keras_acc)
+        return ddddocr, "ddddocr", max(0.4, ddddocr_acc)
 
     # ── Feedback API (called by extractors on server accept/reject) ──
 
@@ -377,6 +445,8 @@ class EnsembleSolver:
                     self.keras_t2_tracker.record(accepted)
                 elif selected == "ddddocr":
                     self.ddddocr_t2_tracker.record(accepted)
+
+        self._save_stats()
 
     def accuracy_summary(self) -> str:
         """Return human-readable accuracy summary for logging."""

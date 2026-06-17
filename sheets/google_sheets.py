@@ -387,8 +387,12 @@ class SheetsClient:
 
             if court_name == "Party Name | National Company Law Tribunal":
                 active_scrapers.add("nclt")
-                config.NCLT_YEAR_FROM = parse_year(start_date_str)
-                config.NCLT_YEAR_TO = parse_year(end_date_str)
+                nclt_from = parse_year(start_date_str)
+                nclt_to = parse_year(end_date_str)
+                if nclt_from > nclt_to:
+                    nclt_from, nclt_to = nclt_to, nclt_from
+                config.NCLT_YEAR_FROM = max(config.NCLT_FIRST_YEAR, nclt_from)
+                config.NCLT_YEAR_TO = nclt_to
             elif court_name == "Party Name | Supreme Court of India":
                 active_scrapers.add("supreme_court")
                 config.SCI_YEAR_FROM = parse_year(start_date_str)
@@ -424,4 +428,3 @@ class SheetsClient:
             logger.debug("ACTIVE_SCRAPERS: %s", config.ACTIVE_SCRAPERS)
         else:
             logger.warning("No active scrapers found in Config tab. Using existing config.")
-

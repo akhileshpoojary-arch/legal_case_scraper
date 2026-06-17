@@ -22,6 +22,9 @@ SCI_AJAX = f"{SCI_BASE}/wp-admin/admin-ajax.php"
 MAX_CAPTCHA_RETRIES = 15
 IMG_TIMEOUT = 10.0
 DETAIL_TIMEOUT = 30
+# Minimum solver confidence (0–1) required before submitting a captcha answer.
+# 0 disables the gate (default). Set e.g. 0.6 to skip likely-wrong guesses.
+_MIN_CAPTCHA_CONFIDENCE = float(os.environ.get("CAPTCHA_MIN_CONFIDENCE", "0.0"))
 
 SCI_ALL_TABS = [
     "case_details",
@@ -166,7 +169,7 @@ class SCIContinuousExtractor:
         if not text:
             return None, None, None
 
-        soup = BeautifulSoup(text, "html.parser")
+        soup = BeautifulSoup(text, "lxml")
         scid_input = soup.find("input", {"name": "scid"})
         tok_input = soup.find("input", id=lambda x: x and x.startswith("tok_"))
 
@@ -214,7 +217,7 @@ class SCIContinuousExtractor:
         from utils.captcha import (
             record_captcha_feedback,
             save_captcha_image,
-            solve_async_with_metadata as captcha_solve_async,
+            solve_async_with_confidence as captcha_solve_async,
         )
 
         target_label = search_label or f"case_type={case_type} year={year}"
@@ -259,7 +262,9 @@ class SCIContinuousExtractor:
                 continue
 
             # Type 2 model directly predicts the numeric answer
-            captcha_val, solver_name = await captcha_solve_async(img_bytes, 6, "sci")
+            captcha_val, solver_name, captcha_conf = await captcha_solve_async(
+                img_bytes, 6, "sci"
+            )
 
             if not captcha_val:
                 self._metric_inc("captcha_empty")
@@ -268,6 +273,21 @@ class SCIContinuousExtractor:
                     None,
                     "fail",
                     "captcha_empty",
+                    will_retry=attempt < MAX_CAPTCHA_RETRIES,
+                    solver=solver_name,
+                )
+                continue
+
+            # Optional: skip submitting a low-confidence guess and fetch a fresh
+            # captcha instead — saves a server round-trip and proxy burn. Off by
+            # default (CAPTCHA_MIN_CONFIDENCE=0); set e.g. 0.6 to enable.
+            if _MIN_CAPTCHA_CONFIDENCE > 0.0 and captcha_conf < _MIN_CAPTCHA_CONFIDENCE:
+                self._metric_inc("captcha_low_confidence")
+                log_captcha_attempt(
+                    attempt,
+                    captcha_val,
+                    "fail",
+                    "low_confidence",
                     will_retry=attempt < MAX_CAPTCHA_RETRIES,
                     solver=solver_name,
                 )
@@ -430,7 +450,7 @@ class SCIContinuousExtractor:
 
     def _extract_result_row(self, html: str) -> dict | None:
         """Extract case data from the search result HTML table."""
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "lxml")
         for tr in soup.find_all("tr"):
             if not tr.has_attr("data-diary-no"):
                 continue

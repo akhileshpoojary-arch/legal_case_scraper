@@ -115,7 +115,7 @@ class DCContinuousExtractor:
             try:
                 data = json.loads(text)
                 html = data.get("dist_list", "")
-                soup = BeautifulSoup(html, "html.parser")
+                soup = BeautifulSoup(html, "lxml")
                 return [
                     {
                         "dist_code": opt.get("value"),
@@ -151,14 +151,14 @@ class DCContinuousExtractor:
             try:
                 data = json.loads(text)
                 html = data.get("complex_list", "")
-                soup = BeautifulSoup(html, "html.parser")
+                soup = BeautifulSoup(html, "lxml")
                 return [
                     {
                         "complex_code": opt.get("value"),
                         "complex_name": opt.get_text(strip=True),
                     }
                     for opt in soup.find_all("option")
-                    if opt.get("value")
+                    if opt.get("value") and opt.get("value") != "0"
                 ]
             except Exception:
                 await asyncio.sleep(2)
@@ -189,11 +189,11 @@ class DCContinuousExtractor:
             try:
                 data = json.loads(text)
                 html = data.get("establishment_list", "")
-                soup = BeautifulSoup(html, "html.parser")
+                soup = BeautifulSoup(html, "lxml")
                 return [
                     {"est_code": opt.get("value"), "est_name": opt.get_text(strip=True)}
                     for opt in soup.find_all("option")
-                    if opt.get("value")
+                    if opt.get("value") and opt.get("value") != "0"
                 ]
             except Exception:
                 await asyncio.sleep(2)
@@ -235,7 +235,7 @@ class DCContinuousExtractor:
             try:
                 data = json.loads(text)
                 html = data.get("casetype_list", "")
-                soup = BeautifulSoup(html, "html.parser")
+                soup = BeautifulSoup(html, "lxml")
                 res = [
                     {
                         "type_code": opt.get("value"),
@@ -379,7 +379,6 @@ class DCContinuousExtractor:
                         consec_fail < MAX_CAPTCHA_CONSEC_FAILS
                         and attempt < MAX_CAPTCHA_RETRIES
                     ),
-                    solver=solver_name,
                 )
                 if consec_fail >= MAX_CAPTCHA_CONSEC_FAILS:
                     stats["consecutive_fail_cutoff"] += 1
@@ -513,13 +512,17 @@ class DCContinuousExtractor:
             consec_fail = 0
             record_captcha_feedback("dc", True, solver_name)
 
-            soup = BeautifulSoup(party_data, "html.parser")
-            case_links = soup.find_all("a", href="#")
+            soup = BeautifulSoup(party_data, "lxml")
+            case_links = [
+                a
+                for a in soup.find_all("a")
+                if "viewHistory(" in (a.get("onclick") or a.get("onClick") or "")
+            ]
 
             cases: list[dict[str, Any]] = []
             for a in case_links:
                 onclick = a.get("onclick") or a.get("onClick")
-                if onclick and "viewHistory(" in onclick:
+                if onclick:
                     match = re.search(r"viewHistory\((.*?)\)", onclick)
                     if match:
                         args = [arg.strip(" '\"") for arg in match.group(1).split(",")]

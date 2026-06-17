@@ -1,10 +1,39 @@
 from __future__ import annotations
 
+import json
 import multiprocessing
 import os
 import socket
 from datetime import datetime
 from pathlib import Path
+
+
+def save_progress_atomic(path: str | Path, data: dict) -> None:
+    """Write resume-progress JSON atomically (temp file + ``os.replace``).
+
+    A plain ``json.dump`` can leave a truncated/corrupt file if the process is
+    killed mid-write — which would break resume. Writing to a temp file and then
+    atomically replacing means a restart always reads a complete file.
+    """
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=4)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def load_progress_safe(path: str | Path, default: dict) -> dict:
+    """Load resume-progress JSON; return a copy of ``default`` if missing/corrupt."""
+    p = Path(path)
+    if not p.exists():
+        return dict(default)
+    try:
+        with p.open() as f:
+            return json.load(f)
+    except Exception:
+        return dict(default)
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -46,9 +75,7 @@ WRITE_LOCK_STALE_SECONDS = _env_int("WRITE_LOCK_STALE_SECONDS", 1800)
 CLUSTER_CONFIG_REFRESH_SECONDS = _env_int("CLUSTER_CONFIG_REFRESH_SECONDS", 60)
 CLUSTER_WORKER_ID = f"s{SYSTEM_SHARD_ID}"
 WORKER_HOSTNAME = (
-    os.environ.get("RAILWAY_REPLICA_ID")
-    or os.environ.get("RAILWAY_PRIVATE_DOMAIN")
-    or os.environ.get("HOSTNAME")
+    os.environ.get("HOSTNAME")
     or socket.gethostname()
     or "local"
 ).strip()
@@ -92,21 +119,24 @@ SC_PROGRESS_FILE = str(
 
 _CURRENT_YEAR = datetime.today().year
 
-DC_START_YEAR = _env_int("DC_START_YEAR", 1950)
+DAILY_RUN_LOOKBACK_YEARS = max(1, _env_int("DAILY_RUN_LOOKBACK_YEARS", 2))
+_DEFAULT_START_YEAR = max(1950, _CURRENT_YEAR - DAILY_RUN_LOOKBACK_YEARS + 1)
+
+DC_START_YEAR = _env_int("DC_START_YEAR", _DEFAULT_START_YEAR)
 DC_END_YEAR = _env_int("DC_END_YEAR", _CURRENT_YEAR)
 
-HC_START_YEAR = _env_int("HC_START_YEAR", 1950)
+HC_START_YEAR = _env_int("HC_START_YEAR", _DEFAULT_START_YEAR)
 HC_END_YEAR = _env_int("HC_END_YEAR", _CURRENT_YEAR)
 
-SC_START_YEAR = _env_int("SC_START_YEAR", 1950)
+SC_START_YEAR = _env_int("SC_START_YEAR", _DEFAULT_START_YEAR)
 SC_END_YEAR = _env_int("SC_END_YEAR", _CURRENT_YEAR)
 
 # ═══════════════════════════════════════════════════════════════
 #  BATCH SIZES — lower defaults keep long JSON histories from filling RAM.
 #  Increase by env var on large machines if Google Sheets quota is the limit.
 # ═══════════════════════════════════════════════════════════════
-SHEET_FLUSH_CASES = int(os.environ.get("SHEET_FLUSH_CASES", 5000))
-WRITE_BATCH_SIZE = int(os.environ.get("WRITE_BATCH_SIZE", 5000))
+SHEET_FLUSH_CASES = int(os.environ.get("SHEET_FLUSH_CASES", 1000))
+WRITE_BATCH_SIZE = int(os.environ.get("WRITE_BATCH_SIZE", 1000))
 DETAIL_CHUNK_SIZE = 100
 DC_DETAIL_CHUNK_SIZE = DETAIL_CHUNK_SIZE
 HC_DETAIL_CHUNK_SIZE = DETAIL_CHUNK_SIZE
@@ -119,6 +149,11 @@ DC_MIN_WRITE_SIZE = int(os.environ.get("DC_MIN_WRITE_SIZE", SHEET_FLUSH_CASES))
 SC_MAX_CONSECUTIVE_FAILURES = _env_int(
     "SC_EMPTY_STREAK_STOP",
     _env_int("SC_MAX_CONSECUTIVE_FAILURES", 750),
+)
+SC_EMPTY_JUMP_ENABLED = _env_bool("SC_EMPTY_JUMP_ENABLED", False)
+SC_MAX_CAPTCHA_EXHAUSTIONS_PER_CASE = max(
+    1,
+    _env_int("SC_MAX_CAPTCHA_EXHAUSTIONS_PER_CASE", 3),
 )
 HC_MAX_DETAIL_RETRIES = 20
 HC_TELEMETRY_EVERY = 100

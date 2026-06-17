@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
-from pathlib import Path
 from typing import Any
 
 from config import (
@@ -33,6 +31,8 @@ from daily_run.config import (
     DETAIL_SESSION_POOL_SIZE,
     SYSTEM_SHARD_ID,
     WORKER_LABEL,
+    load_progress_safe,
+    save_progress_atomic,
 )
 from daily_run.district_court.extractor import DCContinuousExtractor, DC_STATES
 from daily_run.district_court.parser import build_dc_row, parse_detail_html
@@ -115,6 +115,46 @@ class DCContinuousScraper:
             "status_idx": 0,
         }
 
+    def _reset_from_state(self, prog: dict) -> None:
+        prog["dist_idx"] = 0
+        self._reset_from_district(prog)
+
+    def _reset_from_district(self, prog: dict) -> None:
+        prog["complex_idx"] = 0
+        self._reset_from_complex(prog)
+
+    def _reset_from_complex(self, prog: dict) -> None:
+        prog["est_idx"] = 0
+        self._reset_from_establishment(prog)
+
+    def _reset_from_establishment(self, prog: dict) -> None:
+        prog["case_type_idx"] = 0
+        self._reset_from_case_type(prog)
+
+    def _reset_from_case_type(self, prog: dict) -> None:
+        prog["year"] = DC_END_YEAR
+        prog["status_idx"] = 0
+
+    def _advance_state(self, prog: dict) -> None:
+        prog["state_idx"] = int(prog.get("state_idx", 0) or 0) + 1
+        self._reset_from_state(prog)
+
+    def _advance_district(self, prog: dict) -> None:
+        prog["dist_idx"] = int(prog.get("dist_idx", 0) or 0) + 1
+        self._reset_from_district(prog)
+
+    def _advance_complex(self, prog: dict) -> None:
+        prog["complex_idx"] = int(prog.get("complex_idx", 0) or 0) + 1
+        self._reset_from_complex(prog)
+
+    def _advance_establishment(self, prog: dict) -> None:
+        prog["est_idx"] = int(prog.get("est_idx", 0) or 0) + 1
+        self._reset_from_establishment(prog)
+
+    def _advance_case_type(self, prog: dict) -> None:
+        prog["case_type_idx"] = int(prog.get("case_type_idx", 0) or 0) + 1
+        self._reset_from_case_type(prog)
+
     async def close(self) -> None:
         seen: set[int] = set()
         for sm in self._detail_sessions:
@@ -125,15 +165,10 @@ class DCContinuousScraper:
             await sm.close()
 
     def _load_progress(self) -> dict:
-        p = Path(DC_PROGRESS_FILE)
-        if p.exists():
-            with p.open() as f:
-                return json.load(f)
-        return self._default_progress()
+        return load_progress_safe(DC_PROGRESS_FILE, self._default_progress())
 
     def _save_progress(self, prog: dict) -> None:
-        with open(DC_PROGRESS_FILE, "w") as f:
-            json.dump(prog, f, indent=4)
+        save_progress_atomic(DC_PROGRESS_FILE, prog)
 
     def _refresh_state_slice(self, *, force: bool = False) -> bool:
         now = time.monotonic()
@@ -260,8 +295,7 @@ class DCContinuousScraper:
                 )
                 d_idx = prog.get("dist_idx", 0)
                 if d_idx >= len(districts):
-                    prog["state_idx"] += 1
-                    prog["dist_idx"] = 0
+                    self._advance_state(prog)
                     self._save_progress(prog)
                     continue
 
@@ -278,8 +312,7 @@ class DCContinuousScraper:
                 )
                 c_idx = prog.get("complex_idx", 0)
                 if c_idx >= len(complexes):
-                    prog["dist_idx"] += 1
-                    prog["complex_idx"] = 0
+                    self._advance_district(prog)
                     self._save_progress(prog)
                     continue
 
@@ -300,8 +333,7 @@ class DCContinuousScraper:
 
                 e_idx = prog.get("est_idx", 0)
                 if e_idx >= len(establishments):
-                    prog["complex_idx"] += 1
-                    prog["est_idx"] = 0
+                    self._advance_complex(prog)
                     self._save_progress(prog)
                     continue
 
@@ -326,15 +358,13 @@ class DCContinuousScraper:
                         cplx_code,
                         est_code,
                     )
-                    prog["est_idx"] += 1
-                    prog["case_type_idx"] = 0
+                    self._advance_establishment(prog)
                     self._save_progress(prog)
                     continue
 
                 ct_idx = prog.get("case_type_idx", 0)
                 if ct_idx >= len(case_types):
-                    prog["est_idx"] += 1
-                    prog["case_type_idx"] = 0
+                    self._advance_establishment(prog)
                     self._save_progress(prog)
                     continue
 
@@ -342,10 +372,14 @@ class DCContinuousScraper:
                 case_type_code = ct["type_code"]
                 case_type_name = ct["type_name"]
 
-                yr = prog.get("year", DC_END_YEAR)
-                if yr < DC_START_YEAR:
-                    prog["case_type_idx"] += 1
+                yr = int(prog.get("year", DC_END_YEAR) or DC_END_YEAR)
+                if yr > DC_END_YEAR:
                     prog["year"] = DC_END_YEAR
+                    prog["status_idx"] = 0
+                    self._save_progress(prog)
+                    continue
+                if yr < DC_START_YEAR:
+                    self._advance_case_type(prog)
                     self._save_progress(prog)
                     continue
 

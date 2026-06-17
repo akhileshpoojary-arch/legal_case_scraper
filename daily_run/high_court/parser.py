@@ -62,48 +62,50 @@ def _format_name_list(names: list[str]) -> str:
             result.append(f'"{n}"')
     return ", ".join(result)
 
+_PARTY_NUM_RE = re.compile(r"^\d+\)\s*")
+_ADV_LINE_RE = re.compile(r"^Advocate\s*[-]", re.IGNORECASE)
+_ADV_PREFIX_RE = re.compile(r"^Advocate\s*[-]\s*", re.IGNORECASE)
+_WS_RE = re.compile(r"\s+")
+
 def _parse_party_block(element) -> tuple[list[str], list[str]]:
     if not element:
         return [], []
 
-    raw_html = str(element)
-    raw_html = re.sub(r"</?br\s*/?>", "\n", raw_html, flags=re.IGNORECASE)
-    raw_html = re.sub(r"<[^>]+>", "", raw_html)
-    raw_html = (
-        raw_html.replace("\xa0", " ")
-        .replace("&amp;", "&")
-        .replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-    )
+    lines: list[str] = []
+    buf: list[str] = []
+    for node in element.descendants:
+        if getattr(node, "name", None) == "br":
+            if buf:
+                lines.append("".join(buf).strip())
+                buf = []
+        elif isinstance(node, str):
+            buf.append(node.replace("\xa0", " "))
+    if buf:
+        lines.append("".join(buf).strip())
 
-    lines = [l.strip() for l in raw_html.split("\n") if l.strip()]
-    parties: list[str] = []
-    advocates: list[str] = []
-    seen_parties: set[str] = set()
-    seen_advocates: set[str] = set()
+    parties, advocates = [], []
+    seen_parties, seen_advocates = set(), set()
     last_was_advocate = False
 
-    for line in lines:
-        if re.match(r"^\d+\)", line):
-            party = re.sub(r"^\d+\)\s*", "", line).strip().rstrip(",").strip()
-            party = re.sub(r"\s+", " ", party)
+    for raw_line in lines:
+        line = _WS_RE.sub(" ", raw_line).strip()
+        if not line:
+            continue
+        if _PARTY_NUM_RE.match(line):
+            party = _PARTY_NUM_RE.sub("", line).rstrip(",").strip()
             if party and party not in seen_parties:
                 seen_parties.add(party)
                 parties.append(party)
             last_was_advocate = False
-        elif re.match(r"^Advocate\s*[-]", line, re.IGNORECASE):
-            adv_part = re.sub(
-                r"^Advocate\s*[-]\s*", "", line, flags=re.IGNORECASE
-            )
-            for seg in adv_part.split(","):
+        elif _ADV_LINE_RE.match(line):
+            for seg in _ADV_PREFIX_RE.sub("", line).split(","):
                 a = seg.strip().rstrip(",").strip()
                 if a and a not in seen_advocates:
                     seen_advocates.add(a)
                     advocates.append(a)
             last_was_advocate = True
         elif last_was_advocate:
-            a = re.sub(r"\s+", " ", line).strip().rstrip(",").strip()
+            a = line.rstrip(",").strip()
             if a and a not in seen_advocates:
                 seen_advocates.add(a)
                 advocates.append(a)
@@ -138,7 +140,7 @@ def _direct_rows(table_el) -> list:
 
 def parse_detail_html(html: str) -> dict[str, Any]:
     html = re.sub(r"</br\s*>", "<br/>", html, flags=re.IGNORECASE)
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     out: dict[str, Any] = {}
 
     if soup.find(string=re.compile(r"SQL ERROR", re.IGNORECASE)):
